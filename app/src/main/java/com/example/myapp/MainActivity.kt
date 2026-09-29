@@ -13,6 +13,7 @@ import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Bundle
@@ -20,17 +21,23 @@ import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.text.InputType
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.io.IOException
+import org.json.JSONArray
+import org.json.JSONObject
+import android.os.ParcelFileDescriptor
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data classes
@@ -60,7 +67,7 @@ class WorkItem(
 class SavedRec(val uri: Uri, val number: Int)
 
 // One source image inside the Recreate window.
-class RecSrc(val bmp: Bitmap?, val uri: Uri?, val thumb: Bitmap?, val name: String)
+class RecSrc(val bmp: Bitmap?, val uri: Uri?, val thumb: Bitmap?, val name: String, val w: Int, val h: Int)
 
 enum class Mode { SQUARE, VERTICAL, HORIZONTAL, ERASER }
 
@@ -120,7 +127,7 @@ fun makeCrop(snap: Snapshot, pos: Int, whiteBackground: Boolean): Bitmap? {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The drawing view: SQUARE / VERTICAL / HORIZONTAL / ERASER modes
+// The drawing view: SQUARE / VERTICAL / HORIZONTAL / ERASER modes + zoom / pan
 // ─────────────────────────────────────────────────────────────────────────────
 class SliceView(context: Context) : View(context) {
 
@@ -128,6 +135,23 @@ class SliceView(context: Context) : View(context) {
     private var display: Bitmap? = null
     private var offX = 0f
     private var offY = 0f
+    private var editVer = 0
+
+    // zoom / pan (view = (content + off) * zoom + pan)
+    var zoom = 1f
+        private set
+    private var panX = 0f
+    private var panY = 0f
+    private var gesturing = false
+    private var twoFinger = false
+    private var midPan = false
+    private var lastMidX = 0f
+    private var lastMidY = 0f
+    private var lastDist = 0f
+    private var hoverX = -1f
+    private var hoverY = -1f
+    private var zoomCache: Bitmap? = null
+    private var zoomKey = ""
 
     val slices = ArrayList<SliceRect>()
     val vLines = ArrayList<Int>()
@@ -167,37 +191,31 @@ class SliceView(context: Context) : View(context) {
     private val erasePaint = Paint()
     private val badgeBg = Paint()
     private val badgeText = Paint()
+    private val imgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val hoverPaint = Paint()
 
     init {
+        isFocusable = false
+
         linePaint.color = Color.parseColor("#f7b731")
         linePaint.style = Paint.Style.STROKE
-        linePaint.strokeWidth = 1f
         linePaint.isAntiAlias = false
 
         dashPaint.color = Color.parseColor("#f7b731")
         dashPaint.style = Paint.Style.STROKE
-        dashPaint.strokeWidth = 1f
         dashPaint.isAntiAlias = false
-        dashPaint.pathEffect = DashPathEffect(floatArrayOf(4f, 4f), 0f)
 
         redPaint.color = Color.RED
         redPaint.style = Paint.Style.STROKE
-        redPaint.strokeWidth = 1.5f
-        redPaint.pathEffect = DashPathEffect(floatArrayOf(6f, 6f), 0f)
 
         grayPaint.color = Color.parseColor("#888888")
         grayPaint.style = Paint.Style.STROKE
-        grayPaint.strokeWidth = 1.5f
-        grayPaint.pathEffect = DashPathEffect(floatArrayOf(10f, 10f), 0f)
 
         cyanPaint.color = Color.CYAN
         cyanPaint.style = Paint.Style.STROKE
-        cyanPaint.strokeWidth = 1.5f
 
         erasePaint.color = Color.parseColor("#ff6b6b")
         erasePaint.style = Paint.Style.STROKE
-        erasePaint.strokeWidth = 1.5f
-        erasePaint.pathEffect = DashPathEffect(floatArrayOf(4f, 4f), 0f)
 
         badgeBg.color = Color.parseColor("#f7b731")
         badgeBg.style = Paint.Style.FILL
@@ -207,6 +225,10 @@ class SliceView(context: Context) : View(context) {
         badgeText.textAlign = Paint.Align.CENTER
         badgeText.isFakeBoldText = true
         badgeText.isAntiAlias = true
+
+        hoverPaint.color = Color.parseColor("#8800ffff")
+        hoverPaint.style = Paint.Style.STROKE
+        hoverPaint.strokeWidth = 1f
     }
 
     fun hasImage(): Boolean {
@@ -227,10 +249,20 @@ class SliceView(context: Context) : View(context) {
         hint = ""
     }
 
+    private fun resetView() {
+        zoom = 1f
+        panX = 0f
+        panY = 0f
+        zoomCache = null
+        zoomKey = ""
+        editVer++
+    }
+
     fun setImage(b: Bitmap) {
         full = if (b.isMutable) b else b.copy(Bitmap.Config.ARGB_8888, true)
         display = null
         clearEverything()
+        resetView()
         rebuildDisplay()
         invalidate()
         onChanged?.invoke()
@@ -249,9 +281,64 @@ class SliceView(context: Context) : View(context) {
         full = if (nb.isMutable) nb else nb.copy(Bitmap.Config.ARGB_8888, true)
         display = null
         clearEverything()
+        resetView()
         rebuildDisplay()
         invalidate()
         onChanged?.invoke()
+    }
+
+    // ── zoom / pan ──
+    private fun clampPan() {
+        val d = display ?: return
+        val dwz = d.width * zoom
+        val dhz = d.height * zoom
+        if (dwz >= width) {
+            val minPan = width - (offX + d.width) * zoom
+            val maxPan = -offX * zoom
+            panX = if (panX < minPan) minPan else if (panX > maxPan) maxPan else panX
+        } else {
+            panX = (width - dwz) / 2f - offX * zoom
+        }
+        if (dhz >= height) {
+            val minPan = height - (offY + d.height) * zoom
+            val maxPan = -offY * zoom
+            panY = if (panY < minPan) minPan else if (panY > maxPan) maxPan else panY
+        } else {
+            panY = (height - dhz) / 2f - offY * zoom
+        }
+    }
+
+    fun zoomAt(nz: Float, fx: Float, fy: Float) {
+        if (display == null) return
+        val z = if (nz < 0.1f) 0.1f else if (nz > 8f) 8f else nz
+        val u = (fx - panX) / zoom
+        val v = (fy - panY) / zoom
+        zoom = z
+        panX = fx - u * zoom
+        panY = fy - v * zoom
+        clampPan()
+        invalidate()
+        onChanged?.invoke()
+    }
+
+    fun zoomBy(f: Float) {
+        zoomAt(zoom * f, width / 2f, height / 2f)
+    }
+
+    fun zoomFit() {
+        zoom = 1f
+        panX = 0f
+        panY = 0f
+        clampPan()
+        invalidate()
+        onChanged?.invoke()
+    }
+
+    fun panBy(dx: Float, dy: Float) {
+        panX += dx
+        panY += dy
+        clampPan()
+        invalidate()
     }
 
     // Undo: last slice first; if none, last vertical line (VERTICAL mode) or last horizontal line (HORIZONTAL mode).
@@ -376,12 +463,83 @@ class SliceView(context: Context) : View(context) {
         }
         offX = (width - nw) / 2f
         offY = (height - nh) / 2f
+        clampPan()
+    }
+
+    // Draws the picture itself. When zoomed in, the visible part is taken from the FULL-resolution image (sharp).
+    private fun drawImageLayer(canvas: Canvas, d: Bitmap) {
+        val z = zoom
+        val f = full
+        if (z <= 1f || f == null) {
+            canvas.save()
+            canvas.translate(panX, panY)
+            canvas.scale(z, z)
+            canvas.drawBitmap(d, offX, offY, null)
+            canvas.restore()
+            return
+        }
+        val cx0 = maxOf(0f, (0f - panX) / z - offX)
+        val cy0 = maxOf(0f, (0f - panY) / z - offY)
+        val cx1 = minOf(d.width.toFloat(), (width - panX) / z - offX)
+        val cy1 = minOf(d.height.toFloat(), (height - panY) / z - offY)
+        if (cx1 <= cx0 || cy1 <= cy0) return
+        val sx = f.width.toFloat() / d.width.toFloat()
+        val sy = f.height.toFloat() / d.height.toFloat()
+        val sl = clampInt((cx0 * sx).toInt(), 0, f.width - 1)
+        val st = clampInt((cy0 * sy).toInt(), 0, f.height - 1)
+        val sr = clampInt(Math.ceil((cx1 * sx).toDouble()).toInt(), sl + 1, f.width)
+        val sb = clampInt(Math.ceil((cy1 * sy).toDouble()).toInt(), st + 1, f.height)
+        val src = Rect(sl, st, sr, sb)
+        val dst = RectF(
+            (sl / sx + offX) * z + panX, (st / sy + offY) * z + panY,
+            (sr / sx + offX) * z + panX, (sb / sy + offY) * z + panY
+        )
+        if (maxOf(f.width, f.height) <= 4096) {
+            canvas.drawBitmap(f, src, dst, imgPaint)
+        } else if (gesturing) {
+            canvas.save()
+            canvas.translate(panX, panY)
+            canvas.scale(z, z)
+            canvas.drawBitmap(d, offX, offY, null)
+            canvas.restore()
+        } else {
+            val w = maxOf(1, Math.round(dst.width()))
+            val h = maxOf(1, Math.round(dst.height()))
+            val key = "" + sl + "_" + st + "_" + sr + "_" + sb + "_" + w + "_" + h + "_" + editVer
+            var c = zoomCache
+            if (c == null || zoomKey != key) {
+                val nc = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                Canvas(nc).drawBitmap(f, src, Rect(0, 0, w, h), imgPaint)
+                zoomCache = nc
+                zoomKey = key
+                c = nc
+            }
+            canvas.drawBitmap(c, dst.left, dst.top, null)
+        }
     }
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Color.parseColor("#111122"))
         val d = display ?: return
-        canvas.drawBitmap(d, offX, offY, null)
+        drawImageLayer(canvas, d)
+
+        val z = zoom
+        val inv = 1f / z
+        linePaint.strokeWidth = inv
+        dashPaint.strokeWidth = inv
+        dashPaint.pathEffect = DashPathEffect(floatArrayOf(4f * inv, 4f * inv), 0f)
+        redPaint.strokeWidth = 1.5f * inv
+        redPaint.pathEffect = DashPathEffect(floatArrayOf(6f * inv, 6f * inv), 0f)
+        grayPaint.strokeWidth = 1.5f * inv
+        grayPaint.pathEffect = DashPathEffect(floatArrayOf(10f * inv, 10f * inv), 0f)
+        cyanPaint.strokeWidth = 1.5f * inv
+        erasePaint.strokeWidth = 1.5f * inv
+        erasePaint.pathEffect = DashPathEffect(floatArrayOf(4f * inv, 4f * inv), 0f)
+
+        canvas.save()
+        canvas.translate(panX, panY)
+        canvas.scale(z, z)
+
         val dh = d.height.toFloat()
 
         // vertical lines
@@ -403,7 +561,7 @@ class SliceView(context: Context) : View(context) {
 
             val cx = offX + (r.left + r.right) / 2f
             val cy = offY + (r.top + r.bottom) / 2f
-            val radius = maxOf(10f * density, minOf(22f * density, (r.right - r.left) / 5f))
+            val radius = maxOf(10f * density * inv, minOf(22f * density * inv, (r.right - r.left) / 5f))
             canvas.drawCircle(cx, cy, radius, badgeBg)
             badgeText.textSize = radius * 0.9f
             val fm = badgeText.fontMetrics
@@ -427,6 +585,13 @@ class SliceView(context: Context) : View(context) {
                     canvas.drawLine(offX + b.l, offY + curY, offX + b.r, offY + curY, cyanPaint)
                 }
             }
+        }
+        canvas.restore()
+
+        // mouse crosshair (like the Python app)
+        if (hoverX >= 0f && !gesturing) {
+            canvas.drawLine(hoverX, 0f, hoverX, height.toFloat(), hoverPaint)
+            canvas.drawLine(0f, hoverY, width.toFloat(), hoverY, hoverPaint)
         }
     }
 
@@ -488,34 +653,144 @@ class SliceView(context: Context) : View(context) {
             p.style = Paint.Style.FILL
             c.drawRect(il.toFloat(), it.toFloat(), ir.toFloat(), ib.toFloat(), p)
             display = Bitmap.createScaledBitmap(f, d.width, d.height, true)
+            editVer++
             hint = "Region erased - draw another, or Save to store the erased page"
         }
     }
 
+    private fun toCx(vx: Float, d: Bitmap): Int {
+        return clampInt(((vx - panX) / zoom - offX).toInt(), 0, d.width)
+    }
+
+    private fun toCy(vy: Float, d: Bitmap): Int {
+        return clampInt(((vy - panY) / zoom - offY).toInt(), 0, d.height)
+    }
+
+    private fun dist2(e: MotionEvent): Float {
+        val dx = e.getX(0) - e.getX(1)
+        val dy = e.getY(0) - e.getY(1)
+        return Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+    }
+
+    // Mouse: hover shows a crosshair
+    override fun onHoverEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
+                hoverX = event.x
+                hoverY = event.y
+                invalidate()
+            }
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                hoverX = -1f
+                hoverY = -1f
+                invalidate()
+            }
+        }
+        return true
+    }
+
+    // Mouse wheel: scroll, Shift+wheel: sideways, Ctrl+wheel: zoom
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+            val ctrl = (event.metaState and KeyEvent.META_CTRL_ON) != 0
+            val shift = (event.metaState and KeyEvent.META_SHIFT_ON) != 0
+            val step = 60f * density
+            if (ctrl) {
+                if (v > 0f) zoomAt(zoom * 1.15f, event.x, event.y)
+                else if (v < 0f) zoomAt(zoom / 1.15f, event.x, event.y)
+            } else if (shift) {
+                panBy(v * step, 0f)
+            } else {
+                panBy(h * step, v * step)
+            }
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val d = display ?: return false
-        val x = clampInt((e.x - offX).toInt(), 0, d.width)
-        val y = clampInt((e.y - offY).toInt(), 0, d.height)
 
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                hoverX = -1f
+                twoFinger = false
+                if ((e.buttonState and MotionEvent.BUTTON_TERTIARY) != 0) {
+                    // middle mouse button drags the picture
+                    midPan = true
+                    gesturing = true
+                    lastMidX = e.x
+                    lastMidY = e.y
+                    return true
+                }
+                midPan = false
                 dragging = true
-                startX = x
-                startY = y
-                curX = x
-                curY = y
+                startX = toCx(e.x, d)
+                startY = toCy(e.y, d)
+                curX = startX
+                curY = startY
                 invalidate()
             }
-            MotionEvent.ACTION_MOVE -> {
-                if (dragging) {
-                    curX = x
-                    curY = y
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (e.pointerCount >= 2) {
+                    dragging = false
+                    twoFinger = true
+                    gesturing = true
+                    lastDist = dist2(e)
+                    lastMidX = (e.getX(0) + e.getX(1)) / 2f
+                    lastMidY = (e.getY(0) + e.getY(1)) / 2f
                     invalidate()
                 }
             }
+            MotionEvent.ACTION_MOVE -> {
+                if (midPan) {
+                    panBy(e.x - lastMidX, e.y - lastMidY)
+                    lastMidX = e.x
+                    lastMidY = e.y
+                } else if (twoFinger) {
+                    if (e.pointerCount >= 2) {
+                        val nd = dist2(e)
+                        val mx = (e.getX(0) + e.getX(1)) / 2f
+                        val my = (e.getY(0) + e.getY(1)) / 2f
+                        if (lastDist > 10f && nd > 10f) {
+                            val u = (lastMidX - panX) / zoom
+                            val v = (lastMidY - panY) / zoom
+                            var nz = zoom * nd / lastDist
+                            nz = if (nz < 0.1f) 0.1f else if (nz > 8f) 8f else nz
+                            zoom = nz
+                            panX = mx - u * zoom
+                            panY = my - v * zoom
+                            clampPan()
+                            invalidate()
+                            onChanged?.invoke()
+                        }
+                        lastDist = nd
+                        lastMidX = mx
+                        lastMidY = my
+                    }
+                } else if (dragging) {
+                    curX = toCx(e.x, d)
+                    curY = toCy(e.y, d)
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                lastDist = 0f
+            }
             MotionEvent.ACTION_UP -> {
+                if (midPan || twoFinger) {
+                    midPan = false
+                    twoFinger = false
+                    gesturing = false
+                    invalidate()
+                    return true
+                }
                 if (dragging) {
                     dragging = false
+                    val x = toCx(e.x, d)
+                    val y = toCy(e.y, d)
                     val left = minOf(startX, x)
                     val top = minOf(startY, y)
                     val right = maxOf(startX, x)
@@ -543,6 +818,9 @@ class SliceView(context: Context) : View(context) {
             }
             MotionEvent.ACTION_CANCEL -> {
                 dragging = false
+                midPan = false
+                twoFinger = false
+                gesturing = false
                 invalidate()
             }
         }
@@ -551,45 +829,73 @@ class SliceView(context: Context) : View(context) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Recreate window: arrange images / slices into columns and build one new image
+// Recreate window - same layout logic as RecreateLayoutWindow in the Python app:
+// up to 20 columns, choose how many images go in each column, move images between
+// columns, reorder, remove, gap, background, quick layouts, preview, recreate.
 // ─────────────────────────────────────────────────────────────────────────────
 class RecreateUi(
     private val act: Activity,
     private val srcs: ArrayList<RecSrc>,
     private val onDone: (Bitmap) -> Unit
 ) {
+    private class Quick(val label: String, val color: String, val cols: Int, val sizes: IntArray?)
+
+    private val maxCols = 20
     private val dlg = Dialog(act, android.R.style.Theme_Material_NoActionBar_Fullscreen)
-    private var cols = 1
-    private var rows = 1
+    private val n = srcs.size
+    private val columns = ArrayList<ArrayList<Int>>()
+    private var numCols = 1
     private var gap = 8
+    private var rowsPerGroup = 7
     private var black = false
 
-    private val listBox = LinearLayout(act)
-    private val colsTv = TextView(act)
-    private val rowsTv = TextView(act)
-    private val gapTv = TextView(act)
-    private val bgBtn = Button(act)
-
+    private val colColors = arrayOf(
+        "#4ecdc4", "#f7b731", "#ff6b6b", "#a29bfe", "#fd79a8", "#55efc4", "#fdcb6e",
+        "#74b9ff", "#e17055", "#00cec9", "#6c5ce7", "#00b894", "#d63031", "#0984e3",
+        "#e84393", "#b2bec3", "#fab1a0", "#81ecec", "#dfe6e9", "#636e72"
+    )
     private val colBgs = arrayOf(
-        "#0d2233", "#1a2a0d", "#2a1a0d", "#1a0d2a", "#2a0d1a",
-        "#0d2a1a", "#2a2a0d", "#0d1a2a", "#2a0d0d", "#0d2a2a"
+        "#0d2233", "#1a2a0d", "#2a1a0d", "#1a0d2a", "#2a0d1a", "#0d2a1a", "#2a2a0d",
+        "#0d1a2a", "#2a0d0d", "#0d2a2a", "#1a0d2a", "#0d2a0d", "#2a0d0d", "#0d1a2a",
+        "#2a0d1a", "#1a1a1a", "#2a1a0d", "#0d2a2a", "#1a2a1a", "#2a2a2a"
     )
 
-    private fun dp(v: Int): Int {
-        return (v * act.resources.displayMetrics.density).toInt()
-    }
+    private val colsTv = TextView(act)
+    private val gapTv = TextView(act)
+    private val rpgTv = TextView(act)
+    private val bgBtn = Button(act)
+    private val numBox = LinearLayout(act)
+    private val colsBox = LinearLayout(act)
+    private val statusTv = TextView(act)
 
     init {
-        rows = if (srcs.size > 0) srcs.size else 1
+        for (i in 0 until maxCols) columns.add(ArrayList<Int>())
+        for (i in 0 until n) columns[0].add(i)
+        numCols = minOf(2, maxOf(1, n))
         buildUi()
-        refresh()
+        renderColumns()
+        buildNumBar()
     }
 
     fun show() {
         dlg.show()
     }
 
-    private fun smallBtn(label: String, action: () -> Unit): Button {
+    private fun dp(v: Int): Int {
+        return (v * act.resources.displayMetrics.density).toInt()
+    }
+
+    private fun col(s: String): Int {
+        return Color.parseColor(s)
+    }
+
+    private fun lp(w: Int, h: Int): LinearLayout.LayoutParams {
+        val p = LinearLayout.LayoutParams(w, h)
+        p.setMargins(dp(1), dp(1), dp(1), dp(1))
+        return p
+    }
+
+    private fun btn(label: String, bg: String, fg: String, action: () -> Unit): Button {
         val b = Button(act)
         b.text = label
         b.isAllCaps = false
@@ -598,177 +904,423 @@ class RecreateUi(
         b.minimumWidth = 0
         b.minHeight = 0
         b.minimumHeight = 0
-        b.setPadding(dp(8), dp(6), dp(8), dp(6))
+        b.setPadding(dp(8), dp(5), dp(8), dp(5))
+        b.setBackgroundColor(col(bg))
+        b.setTextColor(col(fg))
         b.setOnClickListener { action() }
         return b
     }
 
-    private fun label(t: String): TextView {
+    private fun label(t: String, color: String): TextView {
         val tv = TextView(act)
         tv.text = t
-        tv.setTextColor(Color.WHITE)
-        tv.textSize = 13f
+        tv.setTextColor(col(color))
+        tv.textSize = 12f
         tv.setPadding(dp(6), 0, dp(6), 0)
+        tv.gravity = Gravity.CENTER_VERTICAL
         return tv
     }
 
-    private fun autoRows() {
-        val n = if (srcs.size > 0) srcs.size else 1
-        rows = (n + cols - 1) / cols
-        if (rows < 1) rows = 1
+    private fun hRow(): LinearLayout {
+        val r = LinearLayout(act)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.gravity = Gravity.CENTER_VERTICAL
+        return r
+    }
+
+    private fun hScroll(inner: View): HorizontalScrollView {
+        val h = HorizontalScrollView(act)
+        h.isHorizontalScrollBarEnabled = false
+        h.addView(inner)
+        return h
+    }
+
+    private fun getNumCols(): Int {
+        return if (numCols < 1) 1 else if (numCols > maxCols) maxCols else numCols
     }
 
     private fun buildUi() {
         val root = LinearLayout(act)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#0d0d1a"))
-        val pad = dp(6)
-        root.setPadding(pad, pad, pad, pad)
+        root.setBackgroundColor(col("#0d0d1a"))
+        root.setPadding(dp(4), dp(4), dp(4), dp(4))
 
-        val title = TextView(act)
-        title.text = "Recreate Layout - " + srcs.size.toString() + " image(s)"
-        title.setTextColor(Color.parseColor("#cba6f7"))
-        title.textSize = 16f
-        title.setPadding(dp(4), dp(4), dp(4), dp(4))
-        root.addView(title)
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
 
-        val r1 = LinearLayout(act)
-        r1.orientation = LinearLayout.HORIZONTAL
-        r1.gravity = Gravity.CENTER_VERTICAL
-        r1.addView(label("Columns"))
-        r1.addView(smallBtn("-") {
-            if (cols > 1) { cols--; autoRows(); refresh() }
-        })
+        // action row
+        val top = hRow()
+        top.addView(label("Recreate Layout", "#cba6f7"))
+        top.addView(btn("RECREATE IMAGE", "#5f27cd", "#ffffff") { doRecreate() }, lp(wrap, wrap))
+        top.addView(btn("Preview", "#1a6b8a", "#ffffff") { doPreview() }, lp(wrap, wrap))
+        top.addView(btn("Reset", "#444444", "#cba6f7") { resetLayout() }, lp(wrap, wrap))
+        top.addView(btn("Close", "#444444", "#ffffff") { dlg.dismiss() }, lp(wrap, wrap))
+        root.addView(hScroll(top))
+
+        // columns count
+        val r1 = hRow()
+        r1.addView(label("Columns:", "#89b4fa"))
+        r1.addView(btn("-", "#313244", "#89b4fa") { setNumCols(numCols - 1) }, lp(wrap, wrap))
+        colsTv.setTextColor(col("#89b4fa"))
+        colsTv.textSize = 14f
+        colsTv.setPadding(dp(6), 0, dp(6), 0)
         r1.addView(colsTv)
-        r1.addView(smallBtn("+") {
-            if (cols < 20) { cols++; autoRows(); refresh() }
-        })
-        r1.addView(label("Rows/col"))
-        r1.addView(smallBtn("-") {
-            if (rows > 1) { rows--; refresh() }
-        })
-        r1.addView(rowsTv)
-        r1.addView(smallBtn("+") {
-            rows++; refresh()
-        })
-        root.addView(r1)
+        r1.addView(btn("+", "#313244", "#89b4fa") { setNumCols(numCols + 1) }, lp(wrap, wrap))
+        for (k in 1..8) {
+            r1.addView(btn(k.toString(), "#1e1e2e", "#89b4fa") { setNumCols(k) }, lp(wrap, wrap))
+        }
+        root.addView(hScroll(r1))
 
-        val r2 = LinearLayout(act)
-        r2.orientation = LinearLayout.HORIZONTAL
-        r2.gravity = Gravity.CENTER_VERTICAL
-        r2.addView(label("Gap"))
-        r2.addView(smallBtn("-") {
-            if (gap >= 4) { gap -= 4; refresh() }
-        })
+        // gap + background
+        val r2 = hRow()
+        r2.addView(label("Gap px:", "#f7b731"))
+        r2.addView(btn("-", "#313244", "#f7b731") {
+            if (gap >= 4) gap -= 4 else gap = 0
+            refreshLabels()
+        }, lp(wrap, wrap))
+        gapTv.setTextColor(Color.WHITE)
+        gapTv.textSize = 14f
+        gapTv.setPadding(dp(6), 0, dp(6), 0)
         r2.addView(gapTv)
-        r2.addView(smallBtn("+") {
-            gap += 4; refresh()
-        })
-        r2.addView(label("Background"))
+        r2.addView(btn("+", "#313244", "#f7b731") {
+            if (gap < 80) gap += 4
+            refreshLabels()
+        }, lp(wrap, wrap))
+        r2.addView(label("BG:", "#a6e3a1"))
         bgBtn.isAllCaps = false
         bgBtn.textSize = 12f
         bgBtn.minWidth = 0
         bgBtn.minimumWidth = 0
         bgBtn.minHeight = 0
         bgBtn.minimumHeight = 0
-        bgBtn.setOnClickListener { black = !black; refresh() }
-        r2.addView(bgBtn)
-        root.addView(r2)
+        bgBtn.setOnClickListener { black = !black; refreshLabels() }
+        r2.addView(bgBtn, lp(wrap, wrap))
+        root.addView(hScroll(r2))
 
-        val hintTv = TextView(act)
-        hintTv.text = "Images fill column 1 first (Rows/col each), then column 2, ... Use Up/Dn to reorder."
-        hintTv.setTextColor(Color.parseColor("#aaaaaa"))
-        hintTv.textSize = 11f
-        hintTv.setPadding(dp(4), dp(2), dp(4), dp(2))
-        root.addView(hintTv)
+        // quick layouts
+        val qs = ArrayList<Quick>()
+        qs.add(Quick("All → 1 col", "#444444", 1, null))
+        qs.add(Quick("2 (1|1)", "#1a6b5a", 2, intArrayOf(1, 1)))
+        qs.add(Quick("2 (2|1)", "#6b3a1a", 2, intArrayOf(2, 1)))
+        qs.add(Quick("2 (1|2)", "#6b1a3a", 2, intArrayOf(1, 2)))
+        qs.add(Quick("2 (2|2)", "#2d6a4f", 2, intArrayOf(2, 2)))
+        qs.add(Quick("2 (3|3)", "#1a4f6a", 2, intArrayOf(3, 3)))
+        qs.add(Quick("2 (4|4)", "#4f1a6a", 2, intArrayOf(4, 4)))
+        qs.add(Quick("3 (1|1|1)", "#1a3a6b", 3, intArrayOf(1, 1, 1)))
+        qs.add(Quick("3 (2|1|1)", "#4f2d6a", 3, intArrayOf(2, 1, 1)))
+        qs.add(Quick("3 (2|2|2)", "#6a4f2d", 3, intArrayOf(2, 2, 2)))
+        qs.add(Quick("3x3 (3|3|3)", "#2d4f6a", 3, intArrayOf(3, 3, 3)))
+        qs.add(Quick("3 (4|4|4)", "#6a2d4f", 3, intArrayOf(4, 4, 4)))
+        qs.add(Quick("4 (2|2|2|2)", "#2d6a4f", 4, intArrayOf(2, 2, 2, 2)))
+        qs.add(Quick("5 (2|2|2|2|2)", "#4f2d6a", 5, intArrayOf(2, 2, 2, 2, 2)))
+        qs.add(Quick("6 (1|1|1|1|1|1)", "#1a5a3a", 6, intArrayOf(1, 1, 1, 1, 1, 1)))
+        qs.add(Quick("7 cols", "#3a1a5a", 7, null))
+        qs.add(Quick("8 cols", "#5a3a1a", 8, null))
+        qs.add(Quick("9 cols", "#1a3a5a", 9, null))
+        qs.add(Quick("10 cols", "#5a1a3a", 10, null))
+        val r3 = hRow()
+        r3.addView(label("Quick Layout:", "#f7b731"))
+        for (q in qs) {
+            r3.addView(btn(q.label, q.color, "#ffffff") {
+                val sz = q.sizes
+                applyQuick(q.cols, if (sz == null) intArrayOf(n) else sz)
+            }, lp(wrap, wrap))
+        }
+        root.addView(hScroll(r3))
 
-        listBox.orientation = LinearLayout.VERTICAL
-        val sv = ScrollView(act)
-        sv.addView(listBox, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        // rows per group
+        val r4 = hRow()
+        r4.addView(label("Set column sizes - Rows/group:", "#a6e3a1"))
+        r4.addView(btn("-", "#313244", "#a6e3a1") {
+            if (rowsPerGroup > 1) rowsPerGroup--
+            buildNumBar()
+        }, lp(wrap, wrap))
+        rpgTv.setTextColor(col("#a6e3a1"))
+        rpgTv.textSize = 14f
+        rpgTv.setPadding(dp(6), 0, dp(6), 0)
+        r4.addView(rpgTv)
+        r4.addView(btn("+", "#313244", "#a6e3a1") {
+            rowsPerGroup++
+            buildNumBar()
+        }, lp(wrap, wrap))
+        for (qv in intArrayOf(3, 5, 7, 10, 15, 20)) {
+            r4.addView(btn(qv.toString(), "#1e1e2e", "#a6e3a1") {
+                rowsPerGroup = qv
+                buildNumBar()
+            }, lp(wrap, wrap))
+        }
+        root.addView(hScroll(r4))
 
-        val bottom = LinearLayout(act)
-        bottom.orientation = LinearLayout.HORIZONTAL
-        val bp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        bottom.addView(smallBtn("Preview") { doPreview() }, bp)
-        bottom.addView(smallBtn("Recreate") { doRecreate() }, bp)
-        bottom.addView(smallBtn("Cancel") { dlg.dismiss() }, bp)
-        root.addView(bottom)
+        // C1..Cn size buttons (0-9)
+        numBox.orientation = LinearLayout.HORIZONTAL
+        val numH = HorizontalScrollView(act)
+        numH.addView(numBox)
+        val numV = ScrollView(act)
+        numV.addView(numH)
+        root.addView(numV, LinearLayout.LayoutParams(match, dp(120)))
+
+        // columns with thumbnails
+        colsBox.orientation = LinearLayout.HORIZONTAL
+        val colsH = HorizontalScrollView(act)
+        colsH.isFillViewport = true
+        colsH.addView(colsBox, ViewGroup.LayoutParams(wrap, match))
+        root.addView(colsH, LinearLayout.LayoutParams(match, 0, 1f))
+
+        statusTv.setTextColor(col("#a6e3a1"))
+        statusTv.textSize = 11f
+        statusTv.setPadding(dp(4), dp(3), dp(4), dp(3))
+        root.addView(statusTv)
 
         dlg.setContentView(root)
+        refreshLabels()
     }
 
-    private fun refresh() {
-        colsTv.text = cols.toString()
-        colsTv.setTextColor(Color.WHITE)
-        rowsTv.text = rows.toString()
-        rowsTv.setTextColor(Color.WHITE)
-        gapTv.text = gap.toString() + "px"
-        gapTv.setTextColor(Color.WHITE)
+    private fun refreshLabels() {
+        colsTv.text = getNumCols().toString()
+        gapTv.text = gap.toString()
+        rpgTv.text = rowsPerGroup.toString()
         if (black) {
             bgBtn.text = "Black"
+            bgBtn.setBackgroundColor(Color.BLACK)
             bgBtn.setTextColor(Color.WHITE)
         } else {
             bgBtn.text = "White"
-            bgBtn.setTextColor(Color.YELLOW)
-        }
-
-        listBox.removeAllViews()
-        for (i in srcs.indices) {
-            val s = srcs[i]
-            val c = minOf(i / rows, cols - 1)
-            val row = LinearLayout(act)
-            row.orientation = LinearLayout.HORIZONTAL
-            row.gravity = Gravity.CENTER_VERTICAL
-            row.setBackgroundColor(Color.parseColor(colBgs[c % colBgs.size]))
-            row.setPadding(dp(4), dp(4), dp(4), dp(4))
-
-            val iv = ImageView(act)
-            iv.scaleType = ImageView.ScaleType.FIT_CENTER
-            if (s.thumb != null) iv.setImageBitmap(s.thumb)
-            row.addView(iv, LinearLayout.LayoutParams(dp(60), dp(60)))
-
-            val tv = TextView(act)
-            tv.text = "#" + (i + 1).toString() + "  " + s.name + "\nColumn " + (c + 1).toString()
-            tv.setTextColor(Color.WHITE)
-            tv.textSize = 12f
-            tv.setPadding(dp(8), 0, dp(8), 0)
-            row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-            val idx = i
-            row.addView(smallBtn("Up") {
-                if (idx > 0) {
-                    val t = srcs[idx]; srcs[idx] = srcs[idx - 1]; srcs[idx - 1] = t; refresh()
-                }
-            })
-            row.addView(smallBtn("Dn") {
-                if (idx < srcs.size - 1) {
-                    val t = srcs[idx]; srcs[idx] = srcs[idx + 1]; srcs[idx + 1] = t; refresh()
-                }
-            })
-            row.addView(smallBtn("X") {
-                srcs.removeAt(idx)
-                if (srcs.size == 0) { dlg.dismiss() } else { autoRows(); refresh() }
-            })
-            listBox.addView(row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            bgBtn.setBackgroundColor(Color.WHITE)
+            bgBtn.setTextColor(Color.BLACK)
         }
     }
 
-    // ── image size / decode helpers ──
-    private fun sizeOf(s: RecSrc): IntArray {
-        val b = s.bmp
-        if (b != null) return intArrayOf(b.width, b.height)
-        val u = s.uri ?: return intArrayOf(1, 1)
-        val o = BitmapFactory.Options()
-        o.inJustDecodeBounds = true
-        val st = act.contentResolver.openInputStream(u)
-        if (st != null) {
-            try { BitmapFactory.decodeStream(st, null, o) } finally { st.close() }
-        }
-        return intArrayOf(maxOf(1, o.outWidth), maxOf(1, o.outHeight))
+    // ── layout operations (ported from the Python RecreateLayoutWindow) ──
+    private fun allInActive(): ArrayList<Int> {
+        val all = ArrayList<Int>()
+        for (ci in 0 until getNumCols()) all.addAll(columns[ci])
+        return all
     }
 
+    private fun setNumCols(v: Int) {
+        numCols = if (v < 1) 1 else if (v > maxCols) maxCols else v
+        val nc = getNumCols()
+        for (ci in nc until maxCols) {
+            columns[0].addAll(columns[ci])
+            columns[ci].clear()
+        }
+        refreshLabels()
+        renderColumns()
+        buildNumBar()
+    }
+
+    private fun setColSize(target: Int, count: Int) {
+        val nc = getNumCols()
+        val all = allInActive()
+        val cnt = if (count > all.size) all.size else count
+        val sizes = IntArray(nc)
+        for (ci in 0 until nc) sizes[ci] = columns[ci].size
+        sizes[target] = cnt
+        for (ci in 0 until maxCols) columns[ci].clear()
+        var pos = 0
+        for (ci in 0 until nc) {
+            val end = minOf(all.size, pos + sizes[ci])
+            columns[ci].addAll(all.subList(pos, end))
+            pos = end
+        }
+        if (pos < all.size) columns[nc - 1].addAll(all.subList(pos, all.size))
+        renderColumns()
+        buildNumBar()
+        val sb = StringBuilder()
+        for (ci in 0 until nc) {
+            if (ci > 0) sb.append(" | ")
+            sb.append("C").append(ci + 1).append(": ").append(columns[ci].size)
+        }
+        statusTv.text = "Column " + (target + 1).toString() + " -> " + cnt.toString() + "  |  " + sb.toString()
+    }
+
+    private fun applyQuick(newCols: Int, sizes: IntArray) {
+        val all = allInActive()
+        if (all.isEmpty()) {
+            for (i in 0 until n) all.add(i)
+        }
+        for (ci in 0 until maxCols) columns[ci].clear()
+        numCols = newCols
+        var pos = 0
+        for (ci in 0 until newCols) {
+            val count = if (ci < sizes.size) sizes[ci] else 0
+            val end = minOf(all.size, pos + count)
+            columns[ci].addAll(all.subList(pos, end))
+            pos = end
+        }
+        if (pos < all.size) columns[newCols - 1].addAll(all.subList(pos, all.size))
+        refreshLabels()
+        renderColumns()
+        buildNumBar()
+        val sb = StringBuilder()
+        for (ci in 0 until newCols) {
+            if (ci > 0) sb.append(" | ")
+            sb.append("C").append(ci + 1).append(": ").append(columns[ci].size)
+        }
+        statusTv.text = "Quick layout applied: " + newCols.toString() + " col(s)  -  " + sb.toString()
+    }
+
+    private fun moveWithin(ci: Int, rowPos: Int, delta: Int) {
+        val c = columns[ci]
+        val np = rowPos + delta
+        if (np < 0 || np >= c.size) return
+        val t = c[rowPos]
+        c[rowPos] = c[np]
+        c[np] = t
+        renderColumns()
+        buildNumBar()
+    }
+
+    private fun moveToCol(from: Int, rowPos: Int, to: Int) {
+        val idx = columns[from].removeAt(rowPos)
+        columns[to].add(idx)
+        renderColumns()
+        buildNumBar()
+    }
+
+    private fun removeFromLayout(ci: Int, rowPos: Int) {
+        columns[ci].removeAt(rowPos)
+        renderColumns()
+        buildNumBar()
+    }
+
+    private fun resetLayout() {
+        for (ci in 0 until maxCols) columns[ci].clear()
+        for (i in 0 until n) columns[0].add(i)
+        numCols = minOf(2, maxOf(1, n))
+        refreshLabels()
+        renderColumns()
+        buildNumBar()
+    }
+
+    // ── UI drawing ──
+    private fun buildNumBar() {
+        rpgTv.text = rowsPerGroup.toString()
+        numBox.removeAllViews()
+        val nc = getNumCols()
+        val rpg = if (rowsPerGroup < 1) 1 else rowsPerGroup
+        val groups = (nc + rpg - 1) / rpg
+        for (g in 0 until groups) {
+            val gl = LinearLayout(act)
+            gl.orientation = LinearLayout.VERTICAL
+            for (row in 0 until rpg) {
+                val ci = g * rpg + row
+                if (ci >= nc) break
+                val clr = colColors[ci % colColors.size]
+                val curN = columns[ci].size
+                val rl = hRow()
+                val tv = TextView(act)
+                tv.text = "C" + (ci + 1).toString() + ":"
+                tv.setTextColor(col(clr))
+                tv.textSize = 12f
+                tv.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                rl.addView(tv, LinearLayout.LayoutParams(dp(40), ViewGroup.LayoutParams.WRAP_CONTENT))
+                for (num in 0..9) {
+                    val active = num == curN
+                    val b = btn(
+                        num.toString(),
+                        if (active) clr else "#1e1e2e",
+                        if (active) "#000000" else clr
+                    ) { setColSize(ci, num) }
+                    rl.addView(b, lp(dp(30), dp(32)))
+                }
+                gl.addView(rl)
+            }
+            val gp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            gp.setMargins(0, 0, dp(18), 0)
+            numBox.addView(gl, gp)
+        }
+    }
+
+    private fun renderColumns() {
+        colsBox.removeAllViews()
+        val nc = getNumCols()
+        for (ci in 0 until nc) {
+            val clr = colColors[ci % colColors.size]
+            val bg = colBgs[ci % colBgs.size]
+            val outer = LinearLayout(act)
+            outer.orientation = LinearLayout.VERTICAL
+            outer.setBackgroundColor(col(bg))
+
+            val hdr = TextView(act)
+            hdr.text = "Column " + (ci + 1).toString() + "  (" + columns[ci].size.toString() + " images)"
+            hdr.setTextColor(col(clr))
+            hdr.textSize = 13f
+            hdr.typeface = android.graphics.Typeface.DEFAULT_BOLD
+            hdr.setPadding(dp(8), dp(6), dp(8), dp(6))
+            outer.addView(hdr)
+
+            val inner = LinearLayout(act)
+            inner.orientation = LinearLayout.VERTICAL
+            for ((rowPos, imgIdx) in columns[ci].withIndex()) {
+                inner.addView(makeCard(ci, rowPos, imgIdx, nc, clr), lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            }
+            val sv = ScrollView(act)
+            sv.addView(inner)
+            outer.addView(sv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+            val op = LinearLayout.LayoutParams(dp(220), ViewGroup.LayoutParams.MATCH_PARENT)
+            op.setMargins(dp(3), dp(3), dp(3), dp(3))
+            colsBox.addView(outer, op)
+        }
+        updateStatus()
+    }
+
+    private fun makeCard(ci: Int, rowPos: Int, imgIdx: Int, nc: Int, clr: String): View {
+        val s = srcs[imgIdx]
+        val card = LinearLayout(act)
+        card.orientation = LinearLayout.VERTICAL
+        card.setBackgroundColor(col("#1e1e2e"))
+        card.setPadding(dp(4), dp(4), dp(4), dp(4))
+
+        val nm = TextView(act)
+        var shown = s.name
+        if (shown.length > 24) shown = shown.substring(0, 24)
+        nm.text = "#" + (imgIdx + 1).toString() + "  " + shown
+        nm.setTextColor(col(clr))
+        nm.textSize = 11f
+        nm.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        card.addView(nm)
+
+        val iv = ImageView(act)
+        iv.scaleType = ImageView.ScaleType.FIT_CENTER
+        if (s.thumb != null) iv.setImageBitmap(s.thumb)
+        card.addView(iv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(110)))
+
+        val sz = TextView(act)
+        sz.text = s.w.toString() + "x" + s.h.toString() + " px"
+        sz.setTextColor(col("#6c7086"))
+        sz.textSize = 10f
+        sz.gravity = Gravity.CENTER
+        card.addView(sz)
+
+        val row = hRow()
+        row.addView(btn("▲", "#313244", "#cba6f7") { moveWithin(ci, rowPos, -1) }, lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(btn("▼", "#313244", "#cba6f7") { moveWithin(ci, rowPos, 1) }, lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        for (t in 0 until nc) {
+            if (t == ci) continue
+            val tc = colColors[t % colColors.size]
+            row.addView(btn("→C" + (t + 1).toString(), "#1e1e2e", tc) { moveToCol(ci, rowPos, t) },
+                lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        row.addView(btn("✖", "#1e1e2e", "#ff6b6b") { removeFromLayout(ci, rowPos) }, lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        card.addView(hScroll(row))
+        return card
+    }
+
+    private fun updateStatus() {
+        val nc = getNumCols()
+        var total = 0
+        val sb = StringBuilder()
+        for (ci in 0 until nc) {
+            total += columns[ci].size
+            sb.append("C").append(ci + 1).append(": ").append(columns[ci].size).append("  ")
+        }
+        statusTv.text = "Layout: " + nc.toString() + " column(s)  |  " + total.toString() +
+            " image(s) total  |  " + sb.toString() + " |  use ▲▼ and →C buttons to reorder"
+    }
+
+    // ── compose (port of _compose) ──
     private fun loadFull(s: RecSrc): Bitmap? {
         val b = s.bmp
         if (b != null) return b
@@ -781,38 +1333,29 @@ class RecreateUi(
         }
     }
 
-    // Port of RecreateLayoutWindow._compose
     private fun compose(): Bitmap {
-        val n = srcs.size
-        if (n == 0) throw IllegalStateException("No images")
-
-        val groups = ArrayList<List<RecSrc>>()
-        for (c in 0 until cols) {
-            val from = c * rows
-            if (from >= n) break
-            val to = if (c == cols - 1) n else minOf(n, from + rows)
-            groups.add(ArrayList<RecSrc>(srcs.subList(from, to)))
+        val groups = ArrayList<List<Int>>()
+        for (ci in 0 until getNumCols()) {
+            if (columns[ci].isNotEmpty()) groups.add(ArrayList<Int>(columns[ci]))
         }
+        if (groups.isEmpty()) throw IllegalStateException("No images in any column")
 
+        val g = maxOf(0, gap)
         val colW = IntArray(groups.size)
         val colH = IntArray(groups.size)
         val heights = ArrayList<IntArray>()
-        val g = maxOf(0, gap)
         for (ci in groups.indices) {
             val grp = groups[ci]
             var w = 1
-            val sizes = ArrayList<IntArray>()
-            for (s in grp) {
-                val sz = sizeOf(s)
-                sizes.add(sz)
-                if (sz[0] > w) w = sz[0]
+            for (idx in grp) {
+                if (srcs[idx].w > w) w = srcs[idx].w
             }
             colW[ci] = w
             val hs = IntArray(grp.size)
             var total = 0
             for (k in grp.indices) {
-                val sz = sizes[k]
-                hs[k] = maxOf(1, Math.round(sz[1].toDouble() * w.toDouble() / sz[0].toDouble()).toInt())
+                val s = srcs[grp[k]]
+                hs[k] = maxOf(1, Math.round(s.h.toDouble() * w.toDouble() / maxOf(1, s.w).toDouble()).toInt())
                 total += hs[k]
             }
             total += g * maxOf(0, grp.size - 1)
@@ -831,12 +1374,10 @@ class RecreateUi(
         val pixels = totalW.toDouble() * totalH.toDouble()
         val f = if (pixels > limit) Math.sqrt(limit / pixels) else 1.0
         fun sc(v: Int): Int {
-            return maxOf(1, Math.round(v * f).toInt())
+            return if (f < 1.0) maxOf(1, Math.round(v * f).toInt()) else v
         }
 
-        val outW = if (f < 1.0) sc(totalW) else totalW
-        val outH = if (f < 1.0) sc(totalH) else totalH
-        val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
+        val out = Bitmap.createBitmap(sc(totalW), sc(totalH), Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(if (black) Color.BLACK else Color.WHITE)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -845,18 +1386,18 @@ class RecreateUi(
         for (ci in groups.indices) {
             var y = 0
             val grp = groups[ci]
-            val cw = if (f < 1.0) sc(colW[ci]) else colW[ci]
+            val cw = sc(colW[ci])
             for (k in grp.indices) {
-                val s = grp[k]
-                val hh = if (f < 1.0) sc(heights[ci][k]) else heights[ci][k]
+                val s = srcs[grp[k]]
+                val hh = sc(heights[ci][k])
                 val bmp = loadFull(s)
                 if (bmp != null) {
                     canvas.drawBitmap(bmp, null, Rect(x, y, x + cw, y + hh), paint)
                     if (s.bmp == null) bmp.recycle()
                 }
-                y += hh + (if (f < 1.0) sc(g) else g)
+                y += hh + sc(g)
             }
-            x += cw + (if (f < 1.0) sc(g) else g)
+            x += cw + sc(g)
         }
         return out
     }
@@ -999,7 +1540,22 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
-        root.addView(sliceView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        val frame = FrameLayout(this)
+        frame.addView(sliceView, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val zoomBox = LinearLayout(this)
+        zoomBox.orientation = LinearLayout.VERTICAL
+        zoomBox.alpha = 0.85f
+        val zw = (48 * density).toInt()
+        zoomBox.addView(makeButton("+") { sliceView.zoomBy(1.25f) }, LinearLayout.LayoutParams(zw, zw))
+        zoomBox.addView(makeButton("-") { sliceView.zoomBy(0.8f) }, LinearLayout.LayoutParams(zw, zw))
+        zoomBox.addView(makeButton("Fit") { sliceView.zoomFit() }, LinearLayout.LayoutParams(zw, zw))
+        val zp = FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.END or Gravity.BOTTOM)
+        zp.setMargins(0, 0, (6 * density).toInt(), (12 * density).toInt())
+        frame.addView(zoomBox, zp)
+        root.addView(frame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
 
@@ -1016,8 +1572,230 @@ class MainActivity : Activity() {
                 syncCounter()
             }
         }
+        restoreSession()
         refreshModeButtons()
         updateStatus()
+    }
+
+    // ── Resume: remember opened files, current page, numbering and saved slices ──
+    private fun recsFor(item: WorkItem): ArrayList<SavedRec> {
+        val existing = saved[item]
+        if (existing != null) return existing
+        val fresh = ArrayList<SavedRec>()
+        saved[item] = fresh
+        return fresh
+    }
+
+    private fun saveSession() {
+        try {
+            val arr = JSONArray()
+            var curOut = -1
+            var before = 0
+            for (i in items.indices) {
+                val w = items[i]
+                val u = w.uri
+                if (w.mem != null || u == null) {
+                    if (i < cur) before++
+                    continue
+                }
+                if (i == cur) curOut = arr.length()
+                val o = JSONObject()
+                o.put("u", u.toString())
+                o.put("pdf", w.isPdf)
+                o.put("page", w.page)
+                o.put("label", w.label)
+                o.put("jpeg", w.isJpeg)
+                val ra = JSONArray()
+                val rl = saved[w]
+                if (rl != null) {
+                    for (r in rl) {
+                        val ro = JSONObject()
+                        ro.put("u", r.uri.toString())
+                        ro.put("n", r.number)
+                        ra.put(ro)
+                    }
+                }
+                o.put("recs", ra)
+                arr.put(o)
+            }
+            if (curOut < 0) {
+                curOut = maxOf(0, minOf(cur - before, arr.length() - 1))
+            }
+            val root = JSONObject()
+            root.put("items", arr)
+            root.put("cur", curOut)
+            root.put("next", nextNumber)
+            getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("session", root.toString()).apply()
+        } catch (t: Throwable) {
+        }
+    }
+
+    private fun restoreSession() {
+        try {
+            val txt = getSharedPreferences("slicer", MODE_PRIVATE).getString("session", null) ?: return
+            val root = JSONObject(txt)
+            val arr = root.getJSONArray("items")
+            if (arr.length() == 0) return
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val w = WorkItem(
+                    Uri.parse(o.getString("u")), o.getBoolean("pdf"), o.getInt("page"),
+                    o.getString("label"), o.getBoolean("jpeg"), null
+                )
+                items.add(w)
+                val ra = o.optJSONArray("recs")
+                if (ra != null && ra.length() > 0) {
+                    val l = ArrayList<SavedRec>()
+                    for (k in 0 until ra.length()) {
+                        val ro = ra.getJSONObject(k)
+                        l.add(SavedRec(Uri.parse(ro.getString("u")), ro.getInt("n")))
+                    }
+                    saved[w] = l
+                }
+            }
+            nextNumber = maxOf(1, root.optInt("next", 1))
+            val c = clampInt(root.optInt("cur", 0), 0, items.size - 1)
+            showItem(c)
+            toast("Resumed at page " + (c + 1).toString() + " of " + items.size.toString())
+        } catch (t: Throwable) {
+            items.clear()
+            saved.clear()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        saveSession()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        synchronized(pdfLock) { closePdf() }
+    }
+
+    // ── External keyboard shortcuts (same keys as the Python app) ──
+    private var preBMode = Mode.VERTICAL
+    private var lastRTime = 0L
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN && handleKey(event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun handleKey(ev: KeyEvent): Boolean {
+        val k = ev.keyCode
+        val ctrl = ev.isCtrlPressed
+        val shift = ev.isShiftPressed
+        val first = ev.repeatCount == 0
+        val plain = !ctrl && !ev.isAltPressed && !ev.isMetaPressed
+        val step = 80f * resources.displayMetrics.density
+
+        when (k) {
+            KeyEvent.KEYCODE_PLUS, KeyEvent.KEYCODE_NUMPAD_ADD, KeyEvent.KEYCODE_EQUALS -> {
+                sliceView.zoomBy(1.15f)
+                return true
+            }
+            KeyEvent.KEYCODE_MINUS, KeyEvent.KEYCODE_NUMPAD_SUBTRACT -> {
+                sliceView.zoomBy(1f / 1.15f)
+                return true
+            }
+            KeyEvent.KEYCODE_0, KeyEvent.KEYCODE_NUMPAD_0, KeyEvent.KEYCODE_MOVE_HOME -> {
+                sliceView.zoomFit()
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP -> {
+                sliceView.panBy(0f, step)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
+                sliceView.panBy(0f, -step)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (shift) sliceView.panBy(-step, 0f) else if (first) gotoItem(cur + 1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (shift) sliceView.panBy(step, 0f) else if (first) gotoItem(cur - 1)
+                return true
+            }
+            KeyEvent.KEYCODE_PAGE_DOWN -> {
+                if (first) gotoItem(cur + 1)
+                return true
+            }
+            KeyEvent.KEYCODE_PAGE_UP -> {
+                if (first) gotoItem(cur - 1)
+                return true
+            }
+            KeyEvent.KEYCODE_LEFT_BRACKET -> {
+                if (first) {
+                    if (ctrl) flip(true) else rotate(-90f)
+                }
+                return true
+            }
+            KeyEvent.KEYCODE_RIGHT_BRACKET -> {
+                if (first) {
+                    if (ctrl) flip(false) else rotate(90f)
+                }
+                return true
+            }
+        }
+
+        if (!plain || !first) return false
+
+        when (k) {
+            KeyEvent.KEYCODE_R -> {
+                val now = System.currentTimeMillis()
+                if (now - lastRTime <= 500L) sliceView.removeAll() else sliceView.undo()
+                lastRTime = now
+                return true
+            }
+            KeyEvent.KEYCODE_S -> {
+                doSave()
+                return true
+            }
+            KeyEvent.KEYCODE_V -> {
+                sliceView.toggleVoid()
+                refreshModeButtons()
+                return true
+            }
+            KeyEvent.KEYCODE_X -> {
+                val m = sliceView.mode
+                if (m == Mode.VERTICAL) setMode(Mode.HORIZONTAL)
+                else if (m == Mode.HORIZONTAL) setMode(Mode.VERTICAL)
+                else setMode(preBMode)
+                return true
+            }
+            KeyEvent.KEYCODE_B -> {
+                val m = sliceView.mode
+                if (m == Mode.VERTICAL || m == Mode.HORIZONTAL) preBMode = m
+                setMode(Mode.SQUARE)
+                return true
+            }
+            KeyEvent.KEYCODE_Z -> {
+                val m = sliceView.mode
+                if (m == Mode.VERTICAL || m == Mode.HORIZONTAL) preBMode = m
+                setMode(Mode.ERASER)
+                return true
+            }
+            KeyEvent.KEYCODE_G -> {
+                askGoTo()
+                return true
+            }
+            KeyEvent.KEYCODE_O -> {
+                pickFiles()
+                return true
+            }
+            KeyEvent.KEYCODE_F -> {
+                pickFolder()
+                return true
+            }
+            KeyEvent.KEYCODE_E -> {
+                openRecreate()
+                return true
+            }
+        }
+        return false
     }
 
     // ── small UI helpers ──
@@ -1031,6 +1809,8 @@ class MainActivity : Activity() {
         b.minHeight = 0
         b.minimumHeight = 0
         b.setPadding(2, 12, 2, 12)
+        b.isFocusable = false
+        b.isFocusableInTouchMode = false
         b.setOnClickListener { action() }
         return b
     }
@@ -1096,6 +1876,7 @@ class MainActivity : Activity() {
             sb.append("\n")
             sb.append("pending: ").append(snap.slices.size)
             sb.append(" | next file #").append(nextNumber)
+            sb.append(" | zoom ").append((sliceView.zoom * 100).toInt()).append("%")
             sb.append(" | ").append(if (sliceView.hint.isNotEmpty()) sliceView.hint else modeHint())
         }
         sb.append("\nOutput folder: ").append(folderName())
@@ -1134,6 +1915,15 @@ class MainActivity : Activity() {
         intent.type = "image/*"
         intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
+        val t = outTree
+        if (t != null) {
+            try {
+                intent.putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    DocumentsContract.buildDocumentUriUsingTree(t, DocumentsContract.getTreeDocumentId(t)))
+            } catch (x: Throwable) {
+            }
+        }
         startActivityForResult(intent, REQ_RECREATE)
     }
 
@@ -1212,6 +2002,10 @@ class MainActivity : Activity() {
         Thread(Runnable {
             val list = ArrayList<WorkItem>()
             for (u in uris) {
+                try {
+                    contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (t: Throwable) {
+                }
                 val name = queryName(u)
                 val mime = contentResolver.getType(u) ?: ""
                 val lower = name.lowercase()
@@ -1274,40 +2068,56 @@ class MainActivity : Activity() {
         }
     }
 
+    // The PDF stays open while you move between its pages (fast page turns on big files).
+    private val pdfLock = Any()
+    private var pdfUri: Uri? = null
+    private var pdfPfd: ParcelFileDescriptor? = null
+    private var pdfRenderer: PdfRenderer? = null
+
+    private fun closePdf() {
+        try { pdfRenderer?.close() } catch (t: Throwable) { }
+        try { pdfPfd?.close() } catch (t: Throwable) { }
+        pdfRenderer = null
+        pdfPfd = null
+        pdfUri = null
+    }
+
     private fun renderPdfPage(uri: Uri, page: Int): Bitmap? {
-        try {
-            val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return null
+        synchronized(pdfLock) {
             try {
-                val r = PdfRenderer(pfd)
-                try {
-                    val p = r.openPage(page)
-                    try {
-                        val scale = 150f / 72f
-                        var w = (p.width * scale).toInt()
-                        var h = (p.height * scale).toInt()
-                        val m = maxOf(w, h)
-                        if (m > 4096) {
-                            val k = 4096f / m.toFloat()
-                            w = (w * k).toInt()
-                            h = (h * k).toInt()
-                        }
-                        if (w < 1) w = 1
-                        if (h < 1) h = 1
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        bmp.eraseColor(Color.WHITE)
-                        p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        return bmp
-                    } finally {
-                        p.close()
-                    }
-                } finally {
-                    r.close()
+                if (pdfUri != uri || pdfRenderer == null) {
+                    closePdf()
+                    val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return null
+                    pdfPfd = pfd
+                    pdfRenderer = PdfRenderer(pfd)
+                    pdfUri = uri
                 }
-            } finally {
-                pfd.close()
+                val r = pdfRenderer ?: return null
+                if (page < 0 || page >= r.pageCount) return null
+                val p = r.openPage(page)
+                try {
+                    val scale = 150f / 72f
+                    var w = (p.width * scale).toInt()
+                    var h = (p.height * scale).toInt()
+                    val m = maxOf(w, h)
+                    if (m > 4096) {
+                        val k = 4096f / m.toFloat()
+                        w = (w * k).toInt()
+                        h = (h * k).toInt()
+                    }
+                    if (w < 1) w = 1
+                    if (h < 1) h = 1
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    bmp.eraseColor(Color.WHITE)
+                    p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    return bmp
+                } finally {
+                    p.close()
+                }
+            } catch (t: Throwable) {
+                closePdf()
+                return null
             }
-        } catch (t: Throwable) {
-            return null
         }
     }
 
@@ -1324,6 +2134,7 @@ class MainActivity : Activity() {
     private fun showItem(i: Int) {
         if (i < 0 || i >= items.size) return
         cur = i
+        saveSession()
         loadToken++
         val token = loadToken
         val item = items[i]
@@ -1500,14 +2311,6 @@ class MainActivity : Activity() {
         return m
     }
 
-    private fun recsFor(item: WorkItem): ArrayList<SavedRec> {
-        val existing = saved[item]
-        if (existing != null) return existing
-        val fresh = ArrayList<SavedRec>()
-        saved[item] = fresh
-        return fresh
-    }
-
     // ── Save ──
     private fun doSave() {
         val snap = sliceView.snapshot()
@@ -1534,6 +2337,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     if (uri != null) {
                         recsFor(item).add(SavedRec(uri, -1))
+                        saveSession()
                         toast("Saved " + name)
                     } else {
                         toast("Save failed")
@@ -1554,6 +2358,7 @@ class MainActivity : Activity() {
         nextNumber += count
         sliceView.baseNumber = nextNumber
         sliceView.clearSlices()
+        saveSession()
         toast("Saving " + count.toString() + " slice(s)...")
 
         Thread(Runnable {
@@ -1571,6 +2376,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 recsFor(item).addAll(done)
+                saveSession()
                 toast("Saved " + done.size.toString() + "/" + count.toString() + " to " + folderName())
                 updateStatus()
             }
@@ -1617,6 +2423,7 @@ class MainActivity : Activity() {
             }
         }
         applyBase()
+        saveSession()
         status.text = "Resetting..."
         Thread(Runnable {
             var deleted = 0
@@ -1644,17 +2451,84 @@ class MainActivity : Activity() {
     // ── Recreate ──
     private fun openRecreate() {
         val snap = sliceView.snapshot()
+        val names = ArrayList<String>()
+        val acts = ArrayList<() -> Unit>()
         if (snap != null && snap.slices.isNotEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("Recreate - choose source")
-                .setMessage("You have " + snap.slices.size.toString() + " pending slice(s).")
-                .setPositiveButton("Use slices") { _, _ -> recreateFromSlices(snap) }
-                .setNegativeButton("Pick files") { _, _ -> pickRecreateFiles() }
-                .setNeutralButton("Cancel", null)
-                .show()
-        } else {
-            pickRecreateFiles()
+            names.add("Pending slices (" + snap.slices.size.toString() + ")")
+            acts.add { recreateFromSlices(snap) }
         }
+        if (outTree != null) {
+            names.add("All images in the output folder")
+            acts.add { recreateFromFolder() }
+        }
+        names.add("Pick image files...")
+        acts.add { pickRecreateFiles() }
+        AlertDialog.Builder(this)
+            .setTitle("Recreate - choose source")
+            .setItems(names.toTypedArray()) { _, which -> acts[which]() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun natKey(nm: String): Long {
+        val m = Regex("^(\\d+)").find(nm)
+        if (m == null) return Long.MAX_VALUE
+        return m.groupValues[1].toLongOrNull() ?: Long.MAX_VALUE
+    }
+
+    private fun boundsOf(uri: Uri): IntArray {
+        val o = BitmapFactory.Options()
+        o.inJustDecodeBounds = true
+        try {
+            val st = contentResolver.openInputStream(uri)
+            if (st != null) {
+                try { BitmapFactory.decodeStream(st, null, o) } finally { st.close() }
+            }
+        } catch (t: Throwable) {
+        }
+        return intArrayOf(maxOf(1, o.outWidth), maxOf(1, o.outHeight))
+    }
+
+    // Every image saved in the chosen output folder (1, 2, 3 ... in number order).
+    private fun recreateFromFolder() {
+        val tree = outTree
+        if (tree == null) {
+            toast("Choose the output folder first")
+            return
+        }
+        toast("Reading output folder...")
+        Thread(Runnable {
+            val files = ArrayList<Array<String>>()
+            for (c in listChildren()) {
+                val nm = c[1].lowercase()
+                if (nm.endsWith(".png") || nm.endsWith(".jpg") || nm.endsWith(".jpeg") ||
+                    nm.endsWith(".bmp") || nm.endsWith(".gif") || nm.endsWith(".webp") ||
+                    nm.endsWith(".tif") || nm.endsWith(".tiff")) {
+                    files.add(c)
+                }
+            }
+            files.sortWith(Comparator { x, y ->
+                val kx = natKey(x[1])
+                val ky = natKey(y[1])
+                if (kx != ky) kx.compareTo(ky) else x[1].compareTo(y[1])
+            })
+            val srcs = ArrayList<RecSrc>()
+            for (c in files) {
+                try {
+                    val u = DocumentsContract.buildDocumentUriUsingTree(tree, c[0])
+                    val t = decodeThumb(u, 200)
+                    if (t != null) {
+                        val bd = boundsOf(u)
+                        srcs.add(RecSrc(null, u, t, c[1], bd[0], bd[1]))
+                    }
+                } catch (t: Throwable) {
+                }
+            }
+            runOnUiThread {
+                if (srcs.isEmpty()) toast("No images found in the output folder")
+                else showRecreate(srcs, false)
+            }
+        }).start()
     }
 
     private fun makeThumb(b: Bitmap): Bitmap {
@@ -1671,7 +2545,7 @@ class MainActivity : Activity() {
             for (i in snap.slices.indices) {
                 val crop = makeCrop(snap, i, true)
                 if (crop != null) {
-                    srcs.add(RecSrc(crop, null, makeThumb(crop), "slice " + (i + 1).toString()))
+                    srcs.add(RecSrc(crop, null, makeThumb(crop), "slice " + (i + 1).toString(), crop.width, crop.height))
                 }
             }
             runOnUiThread { showRecreate(srcs, true) }
@@ -1707,7 +2581,10 @@ class MainActivity : Activity() {
             val srcs = ArrayList<RecSrc>()
             for (u in uris) {
                 val t = decodeThumb(u, 200)
-                if (t != null) srcs.add(RecSrc(null, u, t, queryName(u)))
+                if (t != null) {
+                    val bd = boundsOf(u)
+                    srcs.add(RecSrc(null, u, t, queryName(u), bd[0], bd[1]))
+                }
             }
             runOnUiThread { showRecreate(srcs, false) }
         }).start()
