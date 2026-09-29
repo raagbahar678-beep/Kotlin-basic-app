@@ -1500,6 +1500,14 @@ class MainActivity : Activity() {
         return m
     }
 
+    private fun recsFor(item: WorkItem): ArrayList<SavedRec> {
+        val existing = saved[item]
+        if (existing != null) return existing
+        val fresh = ArrayList<SavedRec>()
+        saved[item] = fresh
+        return fresh
+    }
+
     // ── Save ──
     private fun doSave() {
         val snap = sliceView.snapshot()
@@ -1525,12 +1533,7 @@ class MainActivity : Activity() {
                 val uri = saveToTree(snap.full, name, jpeg, existingMap())
                 runOnUiThread {
                     if (uri != null) {
-                        var l = saved[item]
-                        if (l == null) {
-                            l = ArrayList<SavedRec>()
-                            saved[item] = l
-                        }
-                        l.add(SavedRec(uri, -1))
+                        recsFor(item).add(SavedRec(uri, -1))
                         toast("Saved " + name)
                     } else {
                         toast("Save failed")
@@ -1567,12 +1570,7 @@ class MainActivity : Activity() {
                 }
             }
             runOnUiThread {
-                var l = saved[item]
-                if (l == null) {
-                    l = ArrayList<SavedRec>()
-                    saved[item] = l
-                }
-                l.addAll(done)
+                recsFor(item).addAll(done)
                 toast("Saved " + done.size.toString() + "/" + count.toString() + " to " + folderName())
                 updateStatus()
             }
