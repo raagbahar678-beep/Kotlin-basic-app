@@ -142,6 +142,7 @@ class SliceView(context: Context) : View(context) {
         private set
     private var panX = 0f
     private var panY = 0f
+    var moveMode = false
     private var gesturing = false
     private var twoFinger = false
     private var midPan = false
@@ -193,6 +194,13 @@ class SliceView(context: Context) : View(context) {
     private val badgeText = Paint()
     private val imgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val hoverPaint = Paint()
+    private val barTrackPaint = Paint()
+    private val barThumbPaint = Paint()
+    private val barT = 14f * context.resources.displayMetrics.density
+    private val barHit = barT
+    private val barMinThumb = 40f * context.resources.displayMetrics.density
+    private var sbMode = 0
+    private var sbGrab = 0f
 
     init {
         isFocusable = false
@@ -229,6 +237,74 @@ class SliceView(context: Context) : View(context) {
         hoverPaint.color = Color.parseColor("#8800ffff")
         hoverPaint.style = Paint.Style.STROKE
         hoverPaint.strokeWidth = 1f
+
+        barTrackPaint.color = Color.parseColor("#66000000")
+        barTrackPaint.style = Paint.Style.FILL
+        barThumbPaint.color = Color.parseColor("#ccdddddd")
+        barThumbPaint.style = Paint.Style.FILL
+        barThumbPaint.isAntiAlias = true
+    }
+
+    // ── scroll bars (visible only while zoomed in) ──
+    private fun hRange(): Float {
+        val d = display ?: return 0f
+        if (!hVisible()) return 0f
+        return d.width * zoom + (if (vVisible()) barT else 0f) - width
+    }
+
+    private fun vRange(): Float {
+        val d = display ?: return 0f
+        if (!vVisible()) return 0f
+        return d.height * zoom + (if (hVisible()) barT else 0f) - height
+    }
+
+    // returns [thumbStart, thumbLength, trackLength] or null when there is nothing to scroll
+    private fun hThumb(): FloatArray? {
+        val d = display ?: return null
+        val r = hRange()
+        if (r <= 0f) return null
+        val track = width - (if (vRange() > 0f) barT else 0f)
+        var len = track * width / (d.width * zoom + (if (vVisible()) barT else 0f))
+        if (len < barMinThumb) len = barMinThumb
+        if (len > track) len = track
+        val sc = -(offX * zoom + panX)
+        val f = if (sc / r < 0f) 0f else if (sc / r > 1f) 1f else sc / r
+        return floatArrayOf(f * (track - len), len, track)
+    }
+
+    private fun vThumb(): FloatArray? {
+        val d = display ?: return null
+        val r = vRange()
+        if (r <= 0f) return null
+        val track = height - (if (hRange() > 0f) barT else 0f)
+        var len = track * height / (d.height * zoom + (if (hVisible()) barT else 0f))
+        if (len < barMinThumb) len = barMinThumb
+        if (len > track) len = track
+        val sc = -(offY * zoom + panY)
+        val f = if (sc / r < 0f) 0f else if (sc / r > 1f) 1f else sc / r
+        return floatArrayOf(f * (track - len), len, track)
+    }
+
+    private fun setScrollH(x: Float) {
+        val ht = hThumb() ?: return
+        val span = ht[2] - ht[1]
+        if (span <= 0f) return
+        var f = (x - sbGrab) / span
+        f = if (f < 0f) 0f else if (f > 1f) 1f else f
+        panX = -(f * hRange()) - offX * zoom
+        clampPan()
+        invalidate()
+    }
+
+    private fun setScrollV(y: Float) {
+        val vt = vThumb() ?: return
+        val span = vt[2] - vt[1]
+        if (span <= 0f) return
+        var f = (y - sbGrab) / span
+        f = if (f < 0f) 0f else if (f > 1f) 1f else f
+        panY = -(f * vRange()) - offY * zoom
+        clampPan()
+        invalidate()
     }
 
     fun hasImage(): Boolean {
@@ -288,19 +364,33 @@ class SliceView(context: Context) : View(context) {
     }
 
     // ── zoom / pan ──
+    private fun hVisible(): Boolean {
+        val d = display ?: return false
+        return d.width * zoom - width > 1f
+    }
+
+    private fun vVisible(): Boolean {
+        val d = display ?: return false
+        return d.height * zoom - height > 1f
+    }
+
+    // The scroll bars sit on top of the picture, so the scroll range gets extra room (barT) and
+    // the last strip of the image can always be brought out from under the bars.
     private fun clampPan() {
         val d = display ?: return
         val dwz = d.width * zoom
         val dhz = d.height * zoom
-        if (dwz >= width) {
-            val minPan = width - (offX + d.width) * zoom
+        if (hVisible()) {
+            val extra = if (vVisible()) barT else 0f
+            val minPan = width - (offX + d.width) * zoom - extra
             val maxPan = -offX * zoom
             panX = if (panX < minPan) minPan else if (panX > maxPan) maxPan else panX
         } else {
             panX = (width - dwz) / 2f - offX * zoom
         }
-        if (dhz >= height) {
-            val minPan = height - (offY + d.height) * zoom
+        if (vVisible()) {
+            val extra = if (hVisible()) barT else 0f
+            val minPan = height - (offY + d.height) * zoom - extra
             val maxPan = -offY * zoom
             panY = if (panY < minPan) minPan else if (panY > maxPan) maxPan else panY
         } else {
@@ -593,6 +683,20 @@ class SliceView(context: Context) : View(context) {
             canvas.drawLine(hoverX, 0f, hoverX, height.toFloat(), hoverPaint)
             canvas.drawLine(0f, hoverY, width.toFloat(), hoverY, hoverPaint)
         }
+
+        // scroll bars
+        val ht = hThumb()
+        if (ht != null) {
+            val top = height - barT
+            canvas.drawRect(0f, top, ht[2], height.toFloat(), barTrackPaint)
+            canvas.drawRoundRect(RectF(ht[0], top + 1f, ht[0] + ht[1], height - 1f), barT / 2f, barT / 2f, barThumbPaint)
+        }
+        val vt = vThumb()
+        if (vt != null) {
+            val left = width - barT
+            canvas.drawRect(left, 0f, width.toFloat(), vt[2], barTrackPaint)
+            canvas.drawRoundRect(RectF(left + 1f, vt[0], width - 1f, vt[0] + vt[1]), barT / 2f, barT / 2f, barThumbPaint)
+        }
     }
 
     private fun findBoundaries(x: Int): Bound? {
@@ -717,7 +821,22 @@ class SliceView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 hoverX = -1f
                 twoFinger = false
-                if ((e.buttonState and MotionEvent.BUTTON_TERTIARY) != 0) {
+                sbMode = 0
+                val htb = hThumb()
+                val vtb = vThumb()
+                if (htb != null && e.y >= height - barHit && e.x <= htb[2]) {
+                    sbMode = 1
+                    sbGrab = if (e.x >= htb[0] && e.x <= htb[0] + htb[1]) e.x - htb[0] else htb[1] / 2f
+                    setScrollH(e.x)
+                    return true
+                }
+                if (vtb != null && e.x >= width - barHit && e.y <= vtb[2]) {
+                    sbMode = 2
+                    sbGrab = if (e.y >= vtb[0] && e.y <= vtb[0] + vtb[1]) e.y - vtb[0] else vtb[1] / 2f
+                    setScrollV(e.y)
+                    return true
+                }
+                if (moveMode || (e.buttonState and MotionEvent.BUTTON_TERTIARY) != 0) {
                     // middle mouse button drags the picture
                     midPan = true
                     gesturing = true
@@ -734,7 +853,7 @@ class SliceView(context: Context) : View(context) {
                 invalidate()
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
-                if (e.pointerCount >= 2) {
+                if (e.pointerCount >= 2 && sbMode == 0) {
                     dragging = false
                     twoFinger = true
                     gesturing = true
@@ -745,6 +864,14 @@ class SliceView(context: Context) : View(context) {
                 }
             }
             MotionEvent.ACTION_MOVE -> {
+                if (sbMode == 1) {
+                    setScrollH(e.x)
+                    return true
+                }
+                if (sbMode == 2) {
+                    setScrollV(e.y)
+                    return true
+                }
                 if (midPan) {
                     panBy(e.x - lastMidX, e.y - lastMidY)
                     lastMidX = e.x
@@ -780,6 +907,10 @@ class SliceView(context: Context) : View(context) {
                 lastDist = 0f
             }
             MotionEvent.ACTION_UP -> {
+                if (sbMode != 0) {
+                    sbMode = 0
+                    return true
+                }
                 if (midPan || twoFinger) {
                     midPan = false
                     twoFinger = false
@@ -817,6 +948,7 @@ class SliceView(context: Context) : View(context) {
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
+                sbMode = 0
                 dragging = false
                 midPan = false
                 twoFinger = false
@@ -1477,6 +1609,8 @@ class MainActivity : Activity() {
     private lateinit var btnVert: Button
     private lateinit var btnHoriz: Button
     private lateinit var btnErase: Button
+    private lateinit var btnMove: Button
+    private var recItem: WorkItem? = null
     private lateinit var btnVoid: Button
 
     private val items = ArrayList<WorkItem>()
@@ -1508,8 +1642,8 @@ class MainActivity : Activity() {
         addRow(root,
             makeButton("Open") { pickFiles() },
             makeButton("Folder") { pickFolder() },
-            makeButton("< Prev") { gotoItem(cur - 1) },
-            makeButton("Next >") { gotoItem(cur + 1) },
+            makeButton("< Prev") { navStep(-1) },
+            makeButton("Next >") { navStep(1) },
             makeButton("Go to") { askGoTo() })
         addRow(root, btnSquare, btnVert, btnHoriz, btnErase, btnVoid)
         addRow(root,
@@ -1523,6 +1657,12 @@ class MainActivity : Activity() {
             makeButton("Rot R") { rotate(90f) },
             makeButton("Flip H") { flip(true) },
             makeButton("Flip V") { flip(false) })
+        btnMove = makeButton("Move") { toggleMove() }
+        addRow(root,
+            makeButton("Zoom +") { sliceView.zoomBy(1.25f) },
+            makeButton("Zoom -") { sliceView.zoomBy(0.8f) },
+            makeButton("Fit") { sliceView.zoomFit() },
+            btnMove)
 
         status = TextView(this)
         status.setTextColor(Color.WHITE)
@@ -1540,22 +1680,7 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         )
-        val frame = FrameLayout(this)
-        frame.addView(sliceView, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        val zoomBox = LinearLayout(this)
-        zoomBox.orientation = LinearLayout.VERTICAL
-        zoomBox.alpha = 0.85f
-        val zw = (48 * density).toInt()
-        zoomBox.addView(makeButton("+") { sliceView.zoomBy(1.25f) }, LinearLayout.LayoutParams(zw, zw))
-        zoomBox.addView(makeButton("-") { sliceView.zoomBy(0.8f) }, LinearLayout.LayoutParams(zw, zw))
-        zoomBox.addView(makeButton("Fit") { sliceView.zoomFit() }, LinearLayout.LayoutParams(zw, zw))
-        val zp = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.END or Gravity.BOTTOM)
-        zp.setMargins(0, 0, (6 * density).toInt(), (12 * density).toInt())
-        frame.addView(zoomBox, zp)
-        root.addView(frame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(sliceView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
 
@@ -1712,19 +1837,19 @@ class MainActivity : Activity() {
                 return true
             }
             KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                if (shift) sliceView.panBy(-step, 0f) else if (first) gotoItem(cur + 1)
+                if (shift) sliceView.panBy(-step, 0f) else if (first) navStep(1)
                 return true
             }
             KeyEvent.KEYCODE_DPAD_LEFT -> {
-                if (shift) sliceView.panBy(step, 0f) else if (first) gotoItem(cur - 1)
+                if (shift) sliceView.panBy(step, 0f) else if (first) navStep(-1)
                 return true
             }
             KeyEvent.KEYCODE_PAGE_DOWN -> {
-                if (first) gotoItem(cur + 1)
+                if (first) navStep(1)
                 return true
             }
             KeyEvent.KEYCODE_PAGE_UP -> {
-                if (first) gotoItem(cur - 1)
+                if (first) navStep(-1)
                 return true
             }
             KeyEvent.KEYCODE_LEFT_BRACKET -> {
@@ -1778,6 +1903,10 @@ class MainActivity : Activity() {
                 setMode(Mode.ERASER)
                 return true
             }
+            KeyEvent.KEYCODE_M -> {
+                toggleMove()
+                return true
+            }
             KeyEvent.KEYCODE_G -> {
                 askGoTo()
                 return true
@@ -1829,6 +1958,23 @@ class MainActivity : Activity() {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
     }
 
+    private fun toggleMove() {
+        sliceView.moveMode = !sliceView.moveMode
+        refreshModeButtons()
+        updateStatus()
+    }
+
+    private fun activeItem(): WorkItem? {
+        val r = recItem
+        if (r != null) return r
+        return if (cur >= 0 && cur < items.size) items[cur] else null
+    }
+
+    // Prev / Next: from a (temporary) recreated image they return to the normal page it came from.
+    private fun navStep(delta: Int) {
+        if (recItem != null && cur >= 0 && cur < items.size) gotoItem(cur) else gotoItem(cur + delta)
+    }
+
     private fun setMode(m: Mode) {
         sliceView.mode = m
         refreshModeButtons()
@@ -1841,6 +1987,7 @@ class MainActivity : Activity() {
         btnVert.setTextColor(if (sliceView.mode == Mode.VERTICAL) on else off)
         btnHoriz.setTextColor(if (sliceView.mode == Mode.HORIZONTAL) on else off)
         btnErase.setTextColor(if (sliceView.mode == Mode.ERASER) on else off)
+        btnMove.setTextColor(if (sliceView.moveMode) on else off)
         btnVoid.setTextColor(if (sliceView.voidActive) on else off)
     }
 
@@ -1867,17 +2014,22 @@ class MainActivity : Activity() {
     private fun updateStatus() {
         val snap = sliceView.snapshot()
         val sb = StringBuilder()
-        if (cur < 0 || snap == null) {
+        val act0 = activeItem()
+        if (act0 == null || snap == null) {
             sb.append("Tap Open to choose images / PDFs (you can select many)")
         } else {
-            sb.append("[").append(cur + 1).append("/").append(items.size).append("] ")
-            sb.append(items[cur].label)
+            if (recItem != null) {
+                sb.append("[RECREATED - temporary, not in the page list] ")
+            } else {
+                sb.append("[").append(cur + 1).append("/").append(items.size).append("] ")
+            }
+            sb.append(act0.label)
             sb.append(" | ").append(snap.full.width).append("x").append(snap.full.height)
             sb.append("\n")
             sb.append("pending: ").append(snap.slices.size)
             sb.append(" | next file #").append(nextNumber)
             sb.append(" | zoom ").append((sliceView.zoom * 100).toInt()).append("%")
-            sb.append(" | ").append(if (sliceView.hint.isNotEmpty()) sliceView.hint else modeHint())
+            sb.append(" | ").append(if (sliceView.hint.isNotEmpty()) sliceView.hint else if (sliceView.moveMode) "MOVE: drag to pan (tap Move again to draw)" else modeHint())
         }
         sb.append("\nOutput folder: ").append(folderName())
         status.text = sb.toString()
@@ -2133,6 +2285,9 @@ class MainActivity : Activity() {
 
     private fun showItem(i: Int) {
         if (i < 0 || i >= items.size) return
+        val oldRec = recItem
+        if (oldRec != null) saved.remove(oldRec)
+        recItem = null
         cur = i
         saveSession()
         loadToken++
@@ -2314,7 +2469,7 @@ class MainActivity : Activity() {
     // ── Save ──
     private fun doSave() {
         val snap = sliceView.snapshot()
-        if (snap == null || cur < 0) {
+        if (snap == null || activeItem() == null) {
             toast("Open an image first")
             return
         }
@@ -2324,7 +2479,7 @@ class MainActivity : Activity() {
             pickFolder()
             return
         }
-        val item = items[cur]
+        val item = activeItem() ?: return
         val jpeg = item.isJpeg
 
         // ERASER mode: save the erased page
@@ -2385,11 +2540,11 @@ class MainActivity : Activity() {
 
     // ── Reset: delete this page's saved slices + restore the original page ──
     private fun doReset() {
-        if (cur < 0 || cur >= items.size) {
+        if (activeItem() == null) {
             toast("Open an image first")
             return
         }
-        val item = items[cur]
+        val item = activeItem() ?: return
         val recs = saved[item]
         val n = if (recs == null) 0 else recs.size
         AlertDialog.Builder(this)
@@ -2437,7 +2592,7 @@ class MainActivity : Activity() {
             }
             val bmp = loadItemBitmap(item)
             runOnUiThread {
-                if (bmp != null && cur >= 0 && cur < items.size && items[cur] === item) {
+                if (bmp != null && activeItem() === item) {
                     sliceView.baseNumber = nextNumber
                     sliceView.setImage(bmp)
                 }
@@ -2595,15 +2750,21 @@ class MainActivity : Activity() {
             toast("No valid images could be loaded")
             return
         }
-        val parentLabel = if (cur >= 0 && cur < items.size) items[cur].label else "recreated"
-        val parentJpeg = if (cur >= 0 && cur < items.size) items[cur].isJpeg else false
+        val cItem = if (cur >= 0 && cur < items.size) items[cur] else null
+        val parentLabel = if (cItem != null) cItem.label else "recreated"
+        val parentJpeg = if (cItem != null) cItem.isJpeg else false
         val ui = RecreateUi(this, srcs) { composed ->
-            // insert the recreated image as a new page right after the current one and open it
+            // The recreated image is TEMPORARY: it is not added to the page list.
             val item = WorkItem(null, false, 0, parentLabel + "_recreated", parentJpeg, composed)
-            val pos = if (cur >= 0 && cur < items.size) cur + 1 else items.size
-            items.add(pos, item)
-            showItem(pos)
-            toast("Recreated image opened as page " + (pos + 1).toString())
+            val old = recItem
+            if (old != null) saved.remove(old)
+            recItem = item
+            loadToken++
+            sliceView.baseNumber = nextNumber
+            sliceView.setImage(composed.copy(Bitmap.Config.ARGB_8888, true))
+            refreshModeButtons()
+            updateStatus()
+            toast("Recreated image opened - Prev/Next returns to your normal pages")
         }
         ui.show()
     }
