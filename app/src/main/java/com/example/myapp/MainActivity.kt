@@ -64,7 +64,7 @@ class WorkItem(
 )
 
 // A file that was written to the output folder (needed for Reset).
-class SavedRec(val uri: Uri, val number: Int)
+class SavedRec(val uri: Uri, val number: Int, val erased: Boolean = false)
 
 // One source image inside the Recreate window.
 class RecSrc(val bmp: Bitmap?, val uri: Uri?, val thumb: Bitmap?, val name: String, val w: Int, val h: Int)
@@ -758,7 +758,7 @@ class SliceView(context: Context) : View(context) {
             c.drawRect(il.toFloat(), it.toFloat(), ir.toFloat(), ib.toFloat(), p)
             display = Bitmap.createScaledBitmap(f, d.width, d.height, true)
             editVer++
-            hint = "Region erased - draw another, or Save to store the erased page"
+            hint = "Region erased - draw another, or Save to store the erased page in the Erased folder"
         }
     }
 
@@ -1600,6 +1600,7 @@ class MainActivity : Activity() {
 
     private val REQ_OPEN = 1
     private val REQ_FOLDER = 2
+    private val REQ_ERASED_FOLDER = 4
     private val REQ_RECREATE = 3
 
     private lateinit var sliceView: SliceView
@@ -1623,6 +1624,11 @@ class MainActivity : Activity() {
 
     private var outTree: Uri? = null
     private var pendingSave = false
+
+    // Separate folder for ERASED pages (chosen by the user). Files are named 1, 2, 3 ...
+    private var erasedTree: Uri? = null
+    private var nextErasedNumber = 1
+    private var pendingErasedSave = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1656,7 +1662,8 @@ class MainActivity : Activity() {
             makeButton("Rot L") { rotate(-90f) },
             makeButton("Rot R") { rotate(90f) },
             makeButton("Flip H") { flip(true) },
-            makeButton("Flip V") { flip(false) })
+            makeButton("Flip V") { flip(false) },
+            makeButton("Erased Dir") { pickErasedFolder() })
         btnMove = makeButton("Move") { toggleMove() }
         addRow(root,
             makeButton("Zoom +") { sliceView.zoomBy(1.25f) },
@@ -1695,6 +1702,18 @@ class MainActivity : Activity() {
             if (ok) {
                 outTree = u
                 syncCounter()
+            }
+        }
+        val es = getSharedPreferences("slicer", MODE_PRIVATE).getString("erased_tree", null)
+        if (es != null) {
+            val eu = Uri.parse(es)
+            var eok = false
+            for (p in contentResolver.persistedUriPermissions) {
+                if (p.uri == eu && p.isWritePermission) eok = true
+            }
+            if (eok) {
+                erasedTree = eu
+                syncErasedCounter()
             }
         }
         restoreSession()
@@ -1737,6 +1756,7 @@ class MainActivity : Activity() {
                         val ro = JSONObject()
                         ro.put("u", r.uri.toString())
                         ro.put("n", r.number)
+                        ro.put("e", r.erased)
                         ra.put(ro)
                     }
                 }
@@ -1750,6 +1770,7 @@ class MainActivity : Activity() {
             root.put("items", arr)
             root.put("cur", curOut)
             root.put("next", nextNumber)
+            root.put("nextErased", nextErasedNumber)
             getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("session", root.toString()).apply()
         } catch (t: Throwable) {
         }
@@ -1773,12 +1794,13 @@ class MainActivity : Activity() {
                     val l = ArrayList<SavedRec>()
                     for (k in 0 until ra.length()) {
                         val ro = ra.getJSONObject(k)
-                        l.add(SavedRec(Uri.parse(ro.getString("u")), ro.getInt("n")))
+                        l.add(SavedRec(Uri.parse(ro.getString("u")), ro.getInt("n"), ro.optBoolean("e", false)))
                     }
                     saved[w] = l
                 }
             }
             nextNumber = maxOf(1, root.optInt("next", 1))
+            nextErasedNumber = maxOf(1, root.optInt("nextErased", 1))
             val c = clampInt(root.optInt("cur", 0), 0, items.size - 1)
             showItem(c)
             toast("Resumed at page " + (c + 1).toString() + " of " + items.size.toString())
@@ -1996,12 +2018,23 @@ class MainActivity : Activity() {
             Mode.SQUARE -> "SQUARE: drag a box for each slice, then Save"
             Mode.VERTICAL -> "VERTICAL: drag/tap to place vertical lines"
             Mode.HORIZONTAL -> "HORIZONTAL: draw lines between two verticals; each new line cuts a slice"
-            Mode.ERASER -> "ERASER: drag a box to erase it (white); Save stores the erased page"
+            Mode.ERASER -> "ERASER: drag a box to erase it (white); Save stores the erased page in the Erased folder (1, 2, 3...)"
         }
     }
 
     private fun folderName(): String {
         val t = outTree ?: return "(not chosen - tap Folder)"
+        try {
+            val id = DocumentsContract.getTreeDocumentId(t)
+            val afterColon = if (id.contains(":")) id.substring(id.indexOf(':') + 1) else id
+            return if (afterColon.isEmpty()) "(root)" else afterColon
+        } catch (e: Throwable) {
+            return t.toString()
+        }
+    }
+
+    private fun erasedFolderName(): String {
+        val t = erasedTree ?: return "(not chosen - tap Erased Dir)"
         try {
             val id = DocumentsContract.getTreeDocumentId(t)
             val afterColon = if (id.contains(":")) id.substring(id.indexOf(':') + 1) else id
@@ -2032,6 +2065,7 @@ class MainActivity : Activity() {
             sb.append(" | ").append(if (sliceView.hint.isNotEmpty()) sliceView.hint else if (sliceView.moveMode) "MOVE: drag to pan (tap Move again to draw)" else modeHint())
         }
         sb.append("\nOutput folder: ").append(folderName())
+        sb.append("\nErased folder: ").append(erasedFolderName()).append(" | next erased #").append(nextErasedNumber)
         status.text = sb.toString()
         btnVoid.setTextColor(if (sliceView.voidActive) Color.parseColor("#f7b731") else Color.WHITE)
     }
@@ -2060,6 +2094,16 @@ class MainActivity : Activity() {
                 Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
         )
         startActivityForResult(intent, REQ_FOLDER)
+    }
+
+    private fun pickErasedFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        startActivityForResult(intent, REQ_ERASED_FOLDER)
     }
 
     private fun pickRecreateFiles() {
@@ -2097,6 +2141,7 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK || data == null) {
             if (requestCode == REQ_FOLDER) pendingSave = false
+            if (requestCode == REQ_ERASED_FOLDER) pendingErasedSave = false
             return
         }
         if (requestCode == REQ_OPEN) {
@@ -2118,6 +2163,26 @@ class MainActivity : Activity() {
                 syncCounter()
                 if (pendingSave) {
                     pendingSave = false
+                    doSave()
+                }
+            }
+        } else if (requestCode == REQ_ERASED_FOLDER) {
+            val u = data.data
+            if (u != null) {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        u,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (t: Throwable) {
+                }
+                erasedTree = u
+                getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("erased_tree", u.toString()).apply()
+                nextErasedNumber = 1
+                updateStatus()
+                syncErasedCounter()
+                if (pendingErasedSave) {
+                    pendingErasedSave = false
                     doSave()
                 }
             }
@@ -2372,9 +2437,9 @@ class MainActivity : Activity() {
     }
 
     // ── output folder (Storage Access Framework) ──
-    private fun listChildren(): ArrayList<Array<String>> {
+    private fun listChildren(treeUri: Uri? = outTree): ArrayList<Array<String>> {
         val out = ArrayList<Array<String>>()
-        val tree = outTree ?: return out
+        val tree = treeUri ?: return out
         try {
             val parentId = DocumentsContract.getTreeDocumentId(tree)
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
@@ -2421,8 +2486,29 @@ class MainActivity : Activity() {
         }).start()
     }
 
-    private fun saveToTree(bmp: Bitmap, name: String, jpeg: Boolean, existing: Map<String, String>): Uri? {
-        val tree = outTree ?: return null
+    // Continue erased numbering after the highest existing "N.ext" file in the erased folder.
+    private fun syncErasedCounter() {
+        val tree = erasedTree ?: return
+        Thread(Runnable {
+            var mx = 0
+            val re = Regex("^(\\d+)\\.[A-Za-z0-9]+\$")
+            for (c in listChildren(tree)) {
+                val m = re.find(c[1])
+                if (m != null) {
+                    val n = m.groupValues[1].toIntOrNull()
+                    if (n != null && n > mx) mx = n
+                }
+            }
+            val best = mx
+            runOnUiThread {
+                if (best + 1 > nextErasedNumber) nextErasedNumber = best + 1
+                updateStatus()
+            }
+        }).start()
+    }
+
+    private fun saveToTree(bmp: Bitmap, name: String, jpeg: Boolean, existing: Map<String, String>, treeUri: Uri? = outTree): Uri? {
+        val tree = treeUri ?: return null
         try {
             val parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
             val oldId = existing[name]
@@ -2458,9 +2544,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun existingMap(): Map<String, String> {
+    private fun existingMap(treeUri: Uri? = outTree): Map<String, String> {
         val m = HashMap<String, String>()
-        for (c in listChildren()) {
+        for (c in listChildren(treeUri)) {
             m[c[1]] = c[0]
         }
         return m
@@ -2473,32 +2559,44 @@ class MainActivity : Activity() {
             toast("Open an image first")
             return
         }
+        val item = activeItem() ?: return
+        val jpeg = item.isJpeg
+
+        // ERASER mode: save the erased page into the ERASED folder as 1, 2, 3 ...
+        if (sliceView.mode == Mode.ERASER) {
+            val etree = erasedTree
+            if (etree == null) {
+                pendingErasedSave = true
+                toast("Choose the erased-images folder first")
+                pickErasedFolder()
+                return
+            }
+            val num = nextErasedNumber
+            nextErasedNumber = num + 1
+            updateStatus()
+            toast("Saving erased image...")
+            Thread(Runnable {
+                val name = num.toString() + (if (jpeg) ".jpg" else ".png")
+                val uri = saveToTree(snap.full, name, jpeg, existingMap(etree), etree)
+                runOnUiThread {
+                    if (uri != null) {
+                        recsFor(item).add(SavedRec(uri, num, true))
+                        saveSession()
+                        toast("Saved erased image " + name)
+                    } else {
+                        if (nextErasedNumber == num + 1) nextErasedNumber = num
+                        toast("Save failed")
+                    }
+                    updateStatus()
+                }
+            }).start()
+            return
+        }
+
         if (outTree == null) {
             pendingSave = true
             toast("Choose the output folder first")
             pickFolder()
-            return
-        }
-        val item = activeItem() ?: return
-        val jpeg = item.isJpeg
-
-        // ERASER mode: save the erased page
-        if (sliceView.mode == Mode.ERASER) {
-            toast("Saving erased image...")
-            Thread(Runnable {
-                val safe = item.label.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                val name = safe + "_erased" + (if (jpeg) ".jpg" else ".png")
-                val uri = saveToTree(snap.full, name, jpeg, existingMap())
-                runOnUiThread {
-                    if (uri != null) {
-                        recsFor(item).add(SavedRec(uri, -1))
-                        saveSession()
-                        toast("Saved " + name)
-                    } else {
-                        toast("Save failed")
-                    }
-                }
-            }).start()
             return
         }
 
@@ -2566,11 +2664,21 @@ class MainActivity : Activity() {
         if (recs != null && recs.size > 0) {
             var minN = Int.MAX_VALUE
             var maxN = -1
+            var minE = Int.MAX_VALUE
+            var maxE = -1
             for (r in recs) {
                 if (r.number >= 0) {
-                    if (r.number < minN) minN = r.number
-                    if (r.number > maxN) maxN = r.number
+                    if (r.erased) {
+                        if (r.number < minE) minE = r.number
+                        if (r.number > maxE) maxE = r.number
+                    } else {
+                        if (r.number < minN) minN = r.number
+                        if (r.number > maxN) maxN = r.number
+                    }
                 }
+            }
+            if (maxE >= 0 && maxE == nextErasedNumber - 1) {
+                nextErasedNumber = minE
             }
             // if this page holds the latest numbers, free them again so numbering stays 1,2,3...
             if (maxN >= 0 && maxN == nextNumber - 1) {
