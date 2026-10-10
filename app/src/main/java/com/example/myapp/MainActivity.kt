@@ -66,6 +66,25 @@ class WorkItem(
 // A file that was written to the output folder (needed for Reset).
 class SavedRec(val uri: Uri, val number: Int, val erased: Boolean = false)
 
+// One entry of the Sources list (a whole PDF file, or an image folder).
+// Each source keeps its own output folder, erased folder, numbering and page position.
+class Source(
+    val id: String,
+    val isPdf: Boolean,
+    val uri: Uri,
+    var name: String,
+    var count: Int,
+    val files: ArrayList<Array<String>>?
+) {
+    var index = 0
+    var outTree: String? = null
+    var erasedTree: String? = null
+    var next = 1
+    var nextErased = 1
+    var done = false
+    val recs = HashMap<Int, ArrayList<SavedRec>>()
+}
+
 // One source image inside the Recreate window.
 class RecSrc(val bmp: Bitmap?, val uri: Uri?, val thumb: Bitmap?, val name: String, val w: Int, val h: Int)
 
@@ -160,7 +179,7 @@ class SliceView(context: Context) : View(context) {
     private val grayLines = HashSet<String>()
     var voidActive = false
 
-    // Number shown on the first pending slice badge (= next file number).
+    // Next file number (used for naming saved files). Badges on screen always count 1, 2, 3... per page.
     var baseNumber = 1
     var hint = ""
     var onChanged: (() -> Unit)? = null
@@ -656,7 +675,7 @@ class SliceView(context: Context) : View(context) {
             badgeText.textSize = radius * 0.9f
             val fm = badgeText.fontMetrics
             val ty = cy - (fm.ascent + fm.descent) / 2f
-            canvas.drawText((baseNumber + i).toString(), cx, ty, badgeText)
+            canvas.drawText((i + 1).toString(), cx, ty, badgeText)
         }
 
         // live preview while dragging
@@ -1601,6 +1620,9 @@ class MainActivity : Activity() {
     private val REQ_OPEN = 1
     private val REQ_FOLDER = 2
     private val REQ_ERASED_FOLDER = 4
+    private val REQ_SRC_OUT = 5
+    private val REQ_ADD_PDF = 6
+    private val REQ_ADD_FOLDER = 7
     private val REQ_RECREATE = 3
 
     private lateinit var sliceView: SliceView
@@ -1629,6 +1651,14 @@ class MainActivity : Activity() {
     private var erasedTree: Uri? = null
     private var nextErasedNumber = 1
     private var pendingErasedSave = false
+
+    // Sources list (multiple PDFs / image folders) - like the P-key window of the Python app
+    private val sources = ArrayList<Source>()
+    private var activeSource: Source? = null
+    private var pendingSwitch: Source? = null
+    private val itemIndex = HashMap<WorkItem, Int>()
+    private var sourcesDlg: Dialog? = null
+    private var sourcesBox: LinearLayout? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1669,7 +1699,8 @@ class MainActivity : Activity() {
             makeButton("Zoom +") { sliceView.zoomBy(1.25f) },
             makeButton("Zoom -") { sliceView.zoomBy(0.8f) },
             makeButton("Fit") { sliceView.zoomFit() },
-            btnMove)
+            btnMove,
+            makeButton("Sources") { showSources() })
 
         status = TextView(this)
         status.setTextColor(Color.WHITE)
@@ -1716,6 +1747,7 @@ class MainActivity : Activity() {
                 syncErasedCounter()
             }
         }
+        loadSources()
         restoreSession()
         refreshModeButtons()
         updateStatus()
@@ -1731,6 +1763,10 @@ class MainActivity : Activity() {
     }
 
     private fun saveSession() {
+        if (activeSource != null) {
+            saveSourceState()
+            return
+        }
         try {
             val arr = JSONArray()
             var curOut = -1
@@ -1771,12 +1807,20 @@ class MainActivity : Activity() {
             root.put("cur", curOut)
             root.put("next", nextNumber)
             root.put("nextErased", nextErasedNumber)
-            getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("session", root.toString()).apply()
+            getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("session", root.toString()).remove("active_source").apply()
         } catch (t: Throwable) {
         }
     }
 
     private fun restoreSession() {
+        val aid = getSharedPreferences("slicer", MODE_PRIVATE).getString("active_source", null)
+        if (aid != null) {
+            val s = findSource(aid)
+            if (s != null) {
+                enterSource(s)
+                return
+            }
+        }
         try {
             val txt = getSharedPreferences("slicer", MODE_PRIVATE).getString("session", null) ?: return
             val root = JSONObject(txt)
@@ -1945,6 +1989,10 @@ class MainActivity : Activity() {
                 openRecreate()
                 return true
             }
+            KeyEvent.KEYCODE_P -> {
+                toggleSources()
+                return true
+            }
         }
         return false
     }
@@ -2054,6 +2102,10 @@ class MainActivity : Activity() {
             if (recItem != null) {
                 sb.append("[RECREATED - temporary, not in the page list] ")
             } else {
+                val asrc = activeSource
+                if (asrc != null) {
+                    sb.append("\u25CF active ").append(if (asrc.isPdf) "PDF: " else "Folder: ").append(asrc.name).append("  ")
+                }
                 sb.append("[").append(cur + 1).append("/").append(items.size).append("] ")
             }
             sb.append(act0.label)
@@ -2106,6 +2158,560 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_ERASED_FOLDER)
     }
 
+    // ═════════════════════════════════════════════════════════════════════════
+    // SOURCES - multiple PDFs / image folders (same idea as the Python app's
+    // "Sources" window). Every source keeps its own output folder, erased
+    // folder, numbering and page position. The active one is marked "active".
+    // ═════════════════════════════════════════════════════════════════════════
+    private fun dp(v: Int): Int {
+        return (v * resources.displayMetrics.density).toInt()
+    }
+
+    private fun usableTree(u: Uri): Uri? {
+        for (p in contentResolver.persistedUriPermissions) {
+            if (p.uri == u && p.isWritePermission) return u
+        }
+        return null
+    }
+
+    private fun findSource(id: String): Source? {
+        for (s in sources) {
+            if (s.id == id) return s
+        }
+        return null
+    }
+
+    private fun treeLabel(t: Uri): String {
+        try {
+            val id = DocumentsContract.getTreeDocumentId(t)
+            val cut = maxOf(id.lastIndexOf('/'), id.lastIndexOf(':'))
+            val n = if (cut >= 0) id.substring(cut + 1) else id
+            return if (n.isEmpty()) "folder" else n
+        } catch (e: Throwable) {
+            return "folder"
+        }
+    }
+
+    private fun loadSources() {
+        sources.clear()
+        try {
+            val p = getSharedPreferences("slicer", MODE_PRIVATE)
+            val defTxt = p.getString("src_defs", null) ?: return
+            val stTxt = p.getString("src_state", null)
+            val st = if (stTxt != null) JSONObject(stTxt) else JSONObject()
+            val arr = JSONArray(defTxt)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                var files: ArrayList<Array<String>>? = null
+                val fa = o.optJSONArray("files")
+                if (fa != null) {
+                    val ff = ArrayList<Array<String>>()
+                    for (k in 0 until fa.length()) {
+                        val e = fa.getJSONArray(k)
+                        ff.add(arrayOf(e.getString(0), e.getString(1)))
+                    }
+                    files = ff
+                }
+                val s = Source(
+                    o.getString("id"), o.getBoolean("pdf"), Uri.parse(o.getString("uri")),
+                    o.getString("name"), o.getInt("count"), files
+                )
+                val so = st.optJSONObject(s.id)
+                if (so != null) {
+                    s.index = so.optInt("i", 0)
+                    s.next = maxOf(1, so.optInt("n", 1))
+                    s.nextErased = maxOf(1, so.optInt("ne", 1))
+                    s.done = so.optBoolean("done", false)
+                    s.outTree = if (so.isNull("out")) null else so.getString("out")
+                    s.erasedTree = if (so.isNull("er")) null else so.getString("er")
+                    val ra = so.optJSONArray("recs")
+                    if (ra != null) {
+                        for (k in 0 until ra.length()) {
+                            val ro = ra.getJSONObject(k)
+                            val pg = ro.getInt("p")
+                            var l = s.recs[pg]
+                            if (l == null) {
+                                l = ArrayList<SavedRec>()
+                                s.recs[pg] = l
+                            }
+                            l.add(SavedRec(Uri.parse(ro.getString("u")), ro.getInt("n"), ro.optBoolean("e", false)))
+                        }
+                    }
+                }
+                sources.add(s)
+            }
+        } catch (t: Throwable) {
+            sources.clear()
+        }
+    }
+
+    // Which sources exist (written only when a source is added / removed / changed).
+    private fun saveSourceDefs() {
+        try {
+            val arr = JSONArray()
+            for (s in sources) {
+                val o = JSONObject()
+                o.put("id", s.id)
+                o.put("pdf", s.isPdf)
+                o.put("uri", s.uri.toString())
+                o.put("name", s.name)
+                o.put("count", s.count)
+                val f = s.files
+                if (f != null) {
+                    val fa = JSONArray()
+                    for (e in f) {
+                        val ea = JSONArray()
+                        ea.put(e[0])
+                        ea.put(e[1])
+                        fa.put(ea)
+                    }
+                    o.put("files", fa)
+                }
+                arr.put(o)
+            }
+            getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("src_defs", arr.toString()).apply()
+        } catch (t: Throwable) {
+        }
+    }
+
+    // Copies the live state (page, numbering, folders, saved files) into the active source.
+    private fun syncActiveSource() {
+        val s = activeSource ?: return
+        if (cur >= 0 && cur < items.size) s.index = cur
+        s.next = nextNumber
+        s.nextErased = nextErasedNumber
+        val ot = outTree
+        if (ot != null) s.outTree = ot.toString()
+        val et = erasedTree
+        if (et != null) s.erasedTree = et.toString()
+        s.recs.clear()
+        for ((w, l) in saved) {
+            val idx = itemIndex[w]
+            if (idx != null && l.isNotEmpty()) s.recs[idx] = ArrayList<SavedRec>(l)
+        }
+    }
+
+    // Page position / numbering / folders of every source (small, written on every page change).
+    private fun saveSourceState() {
+        try {
+            syncActiveSource()
+            val st = JSONObject()
+            for (s in sources) {
+                val so = JSONObject()
+                so.put("i", s.index)
+                so.put("n", s.next)
+                so.put("ne", s.nextErased)
+                so.put("done", s.done)
+                val o1 = s.outTree
+                if (o1 != null) so.put("out", o1)
+                val e1 = s.erasedTree
+                if (e1 != null) so.put("er", e1)
+                val ra = JSONArray()
+                for ((pg, l) in s.recs) {
+                    for (r in l) {
+                        val ro = JSONObject()
+                        ro.put("p", pg)
+                        ro.put("u", r.uri.toString())
+                        ro.put("n", r.number)
+                        ro.put("e", r.erased)
+                        ra.put(ro)
+                    }
+                }
+                so.put("recs", ra)
+                st.put(s.id, so)
+            }
+            val a = activeSource
+            val ed = getSharedPreferences("slicer", MODE_PRIVATE).edit()
+            ed.putString("src_state", st.toString())
+            if (a != null) ed.putString("active_source", a.id) else ed.remove("active_source")
+            ed.apply()
+        } catch (t: Throwable) {
+        }
+    }
+
+    private fun buildSourceItems(s: Source) {
+        if (s.isPdf) {
+            for (pg in 0 until s.count) {
+                val w = WorkItem(s.uri, true, pg,
+                    s.name + " p" + (pg + 1).toString() + "/" + s.count.toString(), false, null)
+                itemIndex[w] = items.size
+                items.add(w)
+            }
+        } else {
+            val fl = s.files
+            if (fl != null) {
+                for (f in fl) {
+                    val u = DocumentsContract.buildDocumentUriUsingTree(s.uri, f[0])
+                    val nm = f[1]
+                    val dot = nm.lastIndexOf('.')
+                    val base = (if (dot > 0) nm.substring(0, dot) else nm).replace('/', '_')
+                    val ext = if (dot > 0) nm.substring(dot + 1).lowercase() else ""
+                    val w = WorkItem(u, false, 0, base, ext == "jpg" || ext == "jpeg", null)
+                    itemIndex[w] = items.size
+                    items.add(w)
+                }
+            }
+        }
+    }
+
+    // Makes `s` the active source: its own folders, numbering, saved files and last page.
+    private fun enterSource(s: Source) {
+        activeSource = s
+        s.done = false
+        val ot = s.outTree
+        outTree = if (ot != null) usableTree(Uri.parse(ot)) else null
+        val et = s.erasedTree
+        erasedTree = if (et != null) usableTree(Uri.parse(et)) else null
+        nextNumber = maxOf(1, s.next)
+        nextErasedNumber = maxOf(1, s.nextErased)
+        val ed = getSharedPreferences("slicer", MODE_PRIVATE).edit()
+        val o2 = outTree
+        if (o2 != null) ed.putString("out_tree", o2.toString())
+        val e2 = erasedTree
+        if (e2 != null) ed.putString("erased_tree", e2.toString())
+        ed.apply()
+
+        items.clear()
+        itemIndex.clear()
+        saved.clear()
+        buildSourceItems(s)
+        for ((idx, l) in s.recs) {
+            if (idx >= 0 && idx < items.size && l.isNotEmpty()) {
+                saved[items[idx]] = ArrayList<SavedRec>(l)
+            }
+        }
+        recItem = null
+        if (items.isEmpty()) {
+            toast("'" + s.name + "' has no pages / images")
+            return
+        }
+        val start = clampInt(s.index, 0, items.size - 1)
+        s.index = start
+        showItem(start)
+        syncCounter()
+        syncErasedCounter()
+        toast("Opened " + s.name + " - page " + (start + 1).toString() + " of " + items.size.toString())
+    }
+
+    private fun pickSourceOutFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        startActivityForResult(intent, REQ_SRC_OUT)
+    }
+
+    // Open / Reopen pressed in the Sources window.
+    private fun requestSwitch(t: Source) {
+        if (activeSource === t) return
+        val pending = sliceView.slices.size
+        if (pending > 0) {
+            AlertDialog.Builder(this)
+                .setTitle("Unsaved slices")
+                .setMessage("You have " + pending.toString() + " unsaved slice(s). Discard them and switch source?")
+                .setPositiveButton("Discard") { _, _ -> beginSwitch(t) }
+                .setNegativeButton("Stay", null)
+                .show()
+        } else {
+            beginSwitch(t)
+        }
+    }
+
+    private fun beginSwitch(t: Source) {
+        saveSession()
+        val ot = t.outTree
+        if (ot == null || usableTree(Uri.parse(ot)) == null) {
+            pendingSwitch = t
+            toast("Select the output folder for '" + t.name + "'")
+            pickSourceOutFolder()
+        } else {
+            enterSource(t)
+        }
+    }
+
+    // Last page of a source finished -> open the next unfinished source automatically.
+    private fun advanceToNextSource() {
+        val cs = activeSource ?: return
+        val start = sources.indexOf(cs)
+        var found: Source? = null
+        for (k in 1 until sources.size) {
+            val c = sources[(start + k) % sources.size]
+            if (!c.done && c.count > 0) {
+                found = c
+                break
+            }
+        }
+        if (found == null) {
+            toast("This is the last page")
+            return
+        }
+        cs.done = true
+        toast("Source finished - opening " + found.name)
+        beginSwitch(found)
+    }
+
+    private fun removeSource(s: Source) {
+        sources.remove(s)
+        if (activeSource === s) {
+            activeSource = null
+            itemIndex.clear()
+        }
+        saveSourceDefs()
+        saveSourceState()
+        saveSession()
+        refreshSources()
+    }
+
+    private fun srcBtn(label: String, bg: String, fg: String, action: () -> Unit): Button {
+        val b = makeButton(label, action)
+        b.setBackgroundColor(Color.parseColor(bg))
+        b.setTextColor(Color.parseColor(fg))
+        b.setPadding(dp(10), dp(8), dp(10), dp(8))
+        return b
+    }
+
+    // P key: open the Sources window, press P again to close it.
+    private fun toggleSources() {
+        val d = sourcesDlg
+        if (d != null) d.dismiss() else showSources()
+    }
+
+    private fun showSources() {
+        syncActiveSource()
+        val d = Dialog(this, android.R.style.Theme_Material_NoActionBar_Fullscreen)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#0d0d1a"))
+        root.setPadding(dp(10), dp(10), dp(10), dp(10))
+
+        val title = TextView(this)
+        title.text = "🗂  SOURCES"
+        title.setTextColor(Color.parseColor("#cba6f7"))
+        title.textSize = 18f
+        title.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        title.gravity = Gravity.CENTER
+        root.addView(title)
+
+        val sub = TextView(this)
+        sub.text = "Each source keeps its own output folder,\nerased folder and page position."
+        sub.setTextColor(Color.parseColor("#8888aa"))
+        sub.textSize = 12f
+        sub.gravity = Gravity.CENTER
+        sub.setPadding(0, dp(2), 0, dp(8))
+        root.addView(sub)
+
+        val btnRow = LinearLayout(this)
+        btnRow.orientation = LinearLayout.HORIZONTAL
+        val m = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        m.setMargins(dp(2), 0, dp(2), 0)
+        btnRow.addView(srcBtn("➕ Add PDF(s)", "#2d2d44", "#89b4fa") { pickPdfsToAdd() }, m)
+        val m2 = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        m2.setMargins(dp(2), 0, dp(2), 0)
+        btnRow.addView(srcBtn("➕ Add Image Folder", "#2d2d44", "#a6e3a1") { pickImageFolderToAdd() }, m2)
+        val m3 = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        m3.setMargins(dp(2), 0, dp(2), 0)
+        btnRow.addView(srcBtn("Close", "#444444", "#ffffff") { d.dismiss() }, m3)
+        root.addView(btnRow)
+
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        val sv = ScrollView(this)
+        sv.addView(box)
+        val svp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        svp.setMargins(0, dp(8), 0, 0)
+        root.addView(sv, svp)
+
+        d.setContentView(root)
+        sourcesDlg = d
+        sourcesBox = box
+        d.setOnDismissListener {
+            sourcesDlg = null
+            sourcesBox = null
+        }
+        d.setOnKeyListener { _, keyCode, ev ->
+            if (keyCode == KeyEvent.KEYCODE_P && ev.action == KeyEvent.ACTION_DOWN && ev.repeatCount == 0) {
+                d.dismiss()
+                true
+            } else {
+                false
+            }
+        }
+        refreshSources()
+        d.show()
+    }
+
+    private fun refreshSources() {
+        val box = sourcesBox ?: return
+        box.removeAllViews()
+        syncActiveSource()
+        if (sources.isEmpty()) {
+            val e = TextView(this)
+            e.text = "No sources added yet."
+            e.setTextColor(Color.parseColor("#8888aa"))
+            e.textSize = 14f
+            e.gravity = Gravity.CENTER
+            e.setPadding(0, dp(30), 0, 0)
+            box.addView(e)
+            return
+        }
+        for (s in sources) {
+            val active = activeSource === s
+            val card = LinearLayout(this)
+            card.orientation = LinearLayout.VERTICAL
+            card.setBackgroundColor(Color.parseColor(if (active) "#2a1a40" else "#161625"))
+            card.setPadding(dp(10), dp(8), dp(10), dp(8))
+
+            val top = LinearLayout(this)
+            top.orientation = LinearLayout.HORIZONTAL
+            val nm = TextView(this)
+            val shown = if (s.name.length <= 26) s.name else s.name.substring(0, 23) + "..."
+            nm.text = (if (s.isPdf) "📄 " else "🗂 ") + shown
+            nm.setTextColor(Color.parseColor(if (active) "#cba6f7" else "#e2e8f0"))
+            nm.textSize = 15f
+            nm.typeface = android.graphics.Typeface.DEFAULT_BOLD
+            top.addView(nm, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            if (active) {
+                val a = TextView(this)
+                a.text = "● active"
+                a.setTextColor(Color.parseColor("#4ecdc4"))
+                a.textSize = 13f
+                a.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                top.addView(a)
+            }
+            card.addView(top)
+
+            val pos = TextView(this)
+            pos.text = "Page " + (s.index + 1).toString() + " of " + s.count.toString() + (if (s.done) "   (finished)" else "")
+            pos.setTextColor(Color.parseColor("#94a3b8"))
+            pos.textSize = 12f
+            pos.setPadding(0, dp(2), 0, dp(6))
+            card.addView(pos)
+
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+            val rp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            rp.setMargins(0, 0, dp(8), 0)
+            row.addView(srcBtn(if (active) "Reopen" else "Open", "#3a3a5a", "#a6e3a1") {
+                sourcesDlg?.dismiss()
+                requestSwitch(s)
+            }, rp)
+            row.addView(srcBtn("Remove", "#3a1a1a", "#ff6b6b") { removeSource(s) })
+            card.addView(row)
+
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.setMargins(0, dp(4), 0, dp(4))
+            box.addView(card, lp)
+        }
+    }
+
+    // Add PDF(s): multi-select, like the "Add PDF" file dialog of the Python app.
+    private fun pickPdfsToAdd() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.type = "application/pdf"
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        startActivityForResult(intent, REQ_ADD_PDF)
+    }
+
+    private fun pickImageFolderToAdd() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        startActivityForResult(intent, REQ_ADD_FOLDER)
+    }
+
+    private fun handleAddPdf(uris: ArrayList<Uri>) {
+        if (uris.isEmpty()) return
+        toast("Reading PDFs...")
+        Thread(Runnable {
+            val added = ArrayList<Source>()
+            val failed = ArrayList<String>()
+            for (u in uris) {
+                try {
+                    contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                } catch (t: Throwable) {
+                }
+                val name = queryName(u)
+                val dot = name.lastIndexOf('.')
+                val base = (if (dot > 0) name.substring(0, dot) else name).replace('/', '_')
+                var n = 0
+                try {
+                    val pfd = contentResolver.openFileDescriptor(u, "r")
+                    if (pfd != null) {
+                        try {
+                            val r = PdfRenderer(pfd)
+                            n = r.pageCount
+                            r.close()
+                        } finally {
+                            pfd.close()
+                        }
+                    }
+                } catch (t: Throwable) {
+                }
+                if (n <= 0) failed.add(name) else added.add(Source("pdf:" + u.toString(), true, u, base, n, null))
+            }
+            runOnUiThread {
+                for (s in added) {
+                    val ex = findSource(s.id)
+                    if (ex != null) {
+                        ex.count = s.count
+                        ex.name = s.name
+                    } else {
+                        sources.add(s)
+                    }
+                }
+                saveSourceDefs()
+                saveSourceState()
+                refreshSources()
+                if (added.isNotEmpty()) toast("Added " + added.size.toString() + " PDF(s)")
+                if (failed.isNotEmpty()) toast("Could not open: " + failed.joinToString(", "))
+            }
+        }).start()
+    }
+
+    private fun handleAddFolder(tree: Uri) {
+        try {
+            contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (t: Throwable) {
+        }
+        toast("Reading folder...")
+        Thread(Runnable {
+            val files = ArrayList<Array<String>>()
+            for (c in listChildren(tree)) {
+                val nm = c[1].lowercase()
+                if (nm.endsWith(".png") || nm.endsWith(".jpg") || nm.endsWith(".jpeg") ||
+                    nm.endsWith(".bmp") || nm.endsWith(".gif") || nm.endsWith(".webp") ||
+                    nm.endsWith(".tif") || nm.endsWith(".tiff")) {
+                    files.add(c)
+                }
+            }
+            files.sortWith(Comparator { x, y -> x[1].compareTo(y[1]) })
+            runOnUiThread {
+                if (files.isEmpty()) {
+                    toast("No supported image files found in that folder")
+                } else {
+                    val id = "folder:" + tree.toString()
+                    val ex = findSource(id)
+                    if (ex != null) {
+                        ex.count = files.size
+                        val fl = ex.files
+                        if (fl != null) {
+                            fl.clear()
+                            fl.addAll(files)
+                        }
+                    } else {
+                        sources.add(Source(id, false, tree, treeLabel(tree), files.size, files))
+                    }
+                    saveSourceDefs()
+                    saveSourceState()
+                    refreshSources()
+                    toast("Added folder with " + files.size.toString() + " image(s)")
+                }
+            }
+        }).start()
+    }
+
     private fun pickRecreateFiles() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
         intent.type = "image/*"
@@ -2142,6 +2748,7 @@ class MainActivity : Activity() {
         if (resultCode != RESULT_OK || data == null) {
             if (requestCode == REQ_FOLDER) pendingSave = false
             if (requestCode == REQ_ERASED_FOLDER) pendingErasedSave = false
+            if (requestCode == REQ_SRC_OUT) pendingSwitch = null
             return
         }
         if (requestCode == REQ_OPEN) {
@@ -2158,6 +2765,7 @@ class MainActivity : Activity() {
                 }
                 outTree = u
                 getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("out_tree", u.toString()).apply()
+                activeSource?.outTree = u.toString()
                 nextNumber = 1
                 applyBase()
                 syncCounter()
@@ -2178,6 +2786,7 @@ class MainActivity : Activity() {
                 }
                 erasedTree = u
                 getSharedPreferences("slicer", MODE_PRIVATE).edit().putString("erased_tree", u.toString()).apply()
+                activeSource?.erasedTree = u.toString()
                 nextErasedNumber = 1
                 updateStatus()
                 syncErasedCounter()
@@ -2186,6 +2795,27 @@ class MainActivity : Activity() {
                     doSave()
                 }
             }
+        } else if (requestCode == REQ_SRC_OUT) {
+            val u = data.data
+            val t = pendingSwitch
+            pendingSwitch = null
+            if (u != null && t != null) {
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        u,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                } catch (x: Throwable) {
+                }
+                t.outTree = u.toString()
+                saveSourceDefs()
+                enterSource(t)
+            }
+        } else if (requestCode == REQ_ADD_PDF) {
+            handleAddPdf(urisFrom(data))
+        } else if (requestCode == REQ_ADD_FOLDER) {
+            val u = data.data
+            if (u != null) handleAddFolder(u)
         } else if (requestCode == REQ_RECREATE) {
             handleRecreatePick(urisFrom(data))
         }
@@ -2257,6 +2887,8 @@ class MainActivity : Activity() {
                     toast("No readable images / PDFs selected")
                     updateStatus()
                 } else {
+                    activeSource = null
+                    itemIndex.clear()
                     items.clear()
                     items.addAll(list)
                     showItem(0)
@@ -2360,6 +2992,8 @@ class MainActivity : Activity() {
         val item = items[i]
         status.text = "Loading " + item.label + "..."
         Thread(Runnable {
+            // A newer page was requested while this one waited: skip the slow render.
+            if (token != loadToken) return@Runnable
             val bmp = loadItemBitmap(item)
             runOnUiThread {
                 if (token == loadToken) {
@@ -2379,6 +3013,20 @@ class MainActivity : Activity() {
     private fun gotoItem(i: Int) {
         if (items.isEmpty()) {
             toast("Open images / PDFs first")
+            return
+        }
+        if (i >= items.size && activeSource != null && sources.size > 1) {
+            val pend = sliceView.slices.size
+            if (pend > 0) {
+                AlertDialog.Builder(this)
+                    .setTitle("Unsaved slices")
+                    .setMessage("You have " + pend.toString() + " unsaved slice(s). Discard them and open the next source?")
+                    .setPositiveButton("Discard") { _, _ -> advanceToNextSource() }
+                    .setNegativeButton("Stay", null)
+                    .show()
+            } else {
+                advanceToNextSource()
+            }
             return
         }
         if (i < 0 || i >= items.size) {
