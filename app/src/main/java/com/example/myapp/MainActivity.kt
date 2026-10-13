@@ -44,7 +44,7 @@ import android.os.ParcelFileDescriptor
 // ─────────────────────────────────────────────────────────────────────────────
 
 // A slice rectangle in DISPLAY-image coordinates.
-// whiteOverlap = registered in SQUARE mode -> areas already covered by an EARLIER slice are blanked white.
+// whiteOverlap is kept for compatibility but no longer used: overlapping / nested slices are never erased.
 class SliceRect(val left: Int, val top: Int, val right: Int, val bottom: Int, val whiteOverlap: Boolean)
 
 // Everything needed to export slices, captured at the moment Save is pressed.
@@ -96,7 +96,7 @@ fun clampInt(v: Int, lo: Int, hi: Int): Int {
 
 // Builds the full-resolution crop for slice number `pos`.
 // Mirrors _register_slice: display -> image scale, int() truncation,
-// and (square-mode slices) any area already covered by an EARLIER slice is filled white.
+// Overlapping or nested slices are NOT erased: every slice is cut with its full content.
 fun makeCrop(snap: Snapshot, pos: Int, whiteBackground: Boolean): Bitmap? {
     val wImg = snap.full.width
     val hImg = snap.full.height
@@ -119,29 +119,7 @@ fun makeCrop(snap: Snapshot, pos: Int, whiteBackground: Boolean): Bitmap? {
     }
     canvas.drawBitmap(snap.full, Rect(cl, ct, cr, cb), Rect(0, 0, cw, ch), null)
 
-    if (!s.whiteOverlap) return out
-
-    val white = Paint()
-    white.color = Color.WHITE
-    white.style = Paint.Style.FILL
-    white.isAntiAlias = false
-
-    for (j in 0 until pos) {
-        val p = snap.slices[j]
-        val ovLeft = maxOf(s.left, p.left)
-        val ovTop = maxOf(s.top, p.top)
-        val ovRight = minOf(s.right, p.right)
-        val ovBottom = minOf(s.bottom, p.bottom)
-        if (ovRight <= ovLeft || ovBottom <= ovTop) continue
-
-        val bl = clampInt(((ovLeft - s.left) * scaleX).toInt(), 0, cw)
-        val bt = clampInt(((ovTop - s.top) * scaleY).toInt(), 0, ch)
-        val br = clampInt(((ovRight - s.left) * scaleX).toInt(), 0, cw)
-        val bb = clampInt(((ovBottom - s.top) * scaleY).toInt(), 0, ch)
-        if (br > bl && bb > bt) {
-            canvas.drawRect(bl.toFloat(), bt.toFloat(), br.toFloat(), bb.toFloat(), white)
-        }
-    }
+    // No white-out: nested and overlapping slices (square, vertical and horizontal) keep their full content.
     return out
 }
 
