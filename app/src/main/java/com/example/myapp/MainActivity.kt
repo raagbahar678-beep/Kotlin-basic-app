@@ -38,6 +38,8 @@ import java.io.IOException
 import org.json.JSONArray
 import org.json.JSONObject
 import android.os.ParcelFileDescriptor
+import android.os.Handler
+import android.os.Looper
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data classes
@@ -1010,6 +1012,16 @@ class RecreateUi(
         dlg.show()
     }
 
+    private var quickToast: Toast? = null
+
+    private fun toast(msg: String) {
+        quickToast?.cancel()
+        val t = Toast.makeText(act, msg, Toast.LENGTH_SHORT)
+        quickToast = t
+        t.show()
+        Handler(Looper.getMainLooper()).postDelayed({ t.cancel() }, 500L)
+    }
+
     private fun dp(v: Int): Int {
         return (v * act.resources.displayMetrics.density).toInt()
     }
@@ -1532,7 +1544,7 @@ class RecreateUi(
     }
 
     private fun doPreview() {
-        Toast.makeText(act, "Building preview...", Toast.LENGTH_SHORT).show()
+        toast("Building preview...")
         Thread(Runnable {
             var result: Bitmap? = null
             var err: String? = null
@@ -1566,7 +1578,7 @@ class RecreateUi(
     }
 
     private fun doRecreate() {
-        Toast.makeText(act, "Recreating...", Toast.LENGTH_SHORT).show()
+        toast("Recreating...")
         Thread(Runnable {
             var result: Bitmap? = null
             var err: String? = null
@@ -2002,8 +2014,19 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
     }
 
+    // All popups are shown for only 0.5 second.
+    private var quickToast: Toast? = null
+
     private fun toast(msg: String) {
-        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        quickToast?.cancel()
+        val t = Toast.makeText(this, msg, Toast.LENGTH_SHORT)
+        quickToast = t
+        t.show()
+        Handler(Looper.getMainLooper()).postDelayed({ t.cancel() }, 500L)
+    }
+
+    private fun toastQuick(msg: String) {
+        toast(msg)
     }
 
     private fun toggleMove() {
@@ -3200,7 +3223,7 @@ class MainActivity : Activity() {
             val num = nextErasedNumber
             nextErasedNumber = num + 1
             updateStatus()
-            toast("Saving erased image...")
+            toastQuick("Saving erased image...")
             Thread(Runnable {
                 val name = num.toString() + (if (jpeg) ".jpg" else ".png")
                 val uri = saveToTree(snap.full, name, jpeg, existingMap(etree), etree)
@@ -3208,7 +3231,7 @@ class MainActivity : Activity() {
                     if (uri != null) {
                         recsFor(item).add(SavedRec(uri, num, true))
                         saveSession()
-                        toast("Saved erased image " + name)
+                        toastQuick("Saved erased image " + name)
                     } else {
                         if (nextErasedNumber == num + 1) nextErasedNumber = num
                         toast("Save failed")
@@ -3238,7 +3261,7 @@ class MainActivity : Activity() {
         sliceView.baseNumber = nextNumber
         sliceView.clearSlices()
         saveSession()
-        toast("Saving " + count.toString() + " slice(s)...")
+        toastQuick("Saving " + count.toString() + " slice(s)...")
 
         Thread(Runnable {
             val existing = existingMap()
@@ -3256,7 +3279,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 recsFor(item).addAll(done)
                 saveSession()
-                toast("Saved " + done.size.toString() + "/" + count.toString() + " to " + folderName())
+                toastQuick("Saved " + done.size.toString() + "/" + count.toString() + " to " + folderName())
                 updateStatus()
             }
         }).start()
